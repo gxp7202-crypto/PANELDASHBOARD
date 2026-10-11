@@ -34,6 +34,13 @@ DB_PATH = os.path.join(DATA, "dashboard.db")
 
 PBKDF2_ITERS = 100_000
 
+# owner bootstrap password: OWNER_PASSWORD env wins, otherwise the fallback below.
+# NOTE: on Render free tier the sqlite file resets on every redeploy, so set the
+# OWNER_PASSWORD env var there — otherwise the fresh owner account reopens with
+# the fallback password.
+BOOTSTRAP_OWNER_PW = os.environ.get("OWNER_PASSWORD", "9319989275")
+LEGACY_DEFAULT_PW = "yadav123"
+
 # ───────────────────────── database ─────────────────────────
 
 def db():
@@ -104,14 +111,21 @@ def init_db():
     if "last_seen" not in cols:
         con.execute("ALTER TABLE keys ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0")
 
-    row = con.execute("SELECT id FROM users WHERE role='owner'").fetchone()
+    row = con.execute("SELECT * FROM users WHERE role='owner'").fetchone()
     if row is None:
         salt = secrets.token_hex(16)
-        h = hash_pw("yadav123", salt)
+        h = hash_pw(BOOTSTRAP_OWNER_PW, salt)
         con.execute(
             "INSERT INTO users (username, pass_hash, pass_salt, role, balance, banned, created_at, created_by)"
             " VALUES (?,?,?,?,?,?,?,NULL)",
             ("owner", h, salt, "owner", 0, 0, int(time.time())))
+    elif hash_pw(LEGACY_DEFAULT_PW, row["pass_salt"]) == row["pass_hash"] \
+            and LEGACY_DEFAULT_PW != BOOTSTRAP_OWNER_PW:
+        # migrate: owner still on the public default -> force to the real password
+        salt = secrets.token_hex(16)
+        con.execute("UPDATE users SET pass_hash=?, pass_salt=? WHERE id=?",
+                    (hash_pw(BOOTSTRAP_OWNER_PW, salt), salt, row["id"]))
+        con.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
     con.commit()
     con.close()
 
@@ -319,8 +333,11 @@ def api_keys_list(handler, qs, body):
         where.append("k.created_by_role=?")
         params.append(origin)
     if q:
-        where.append("(k.key_code LIKE ? OR k.note LIKE ? OR u.username LIKE ? OR k.device LIKE ?)")
-        params += [f"%{q}%"] * 4
+        disp = ("k.key_code || '-' || CASE k.days WHEN -1 THEN 'PERM'"
+                " ELSE CAST(k.days AS TEXT) || 'D' END")
+        where.append(f"({disp} LIKE ? OR k.key_code LIKE ? OR k.note LIKE ?"
+                     " OR u.username LIKE ? OR k.device LIKE ?)")
+        params += [f"%{q}%"] * 5
     sql = ("SELECT k.*, u.username AS by FROM keys k JOIN users u ON u.id=k.created_by"
            + (" WHERE " + " AND ".join(where) if where else "")
            + " ORDER BY k.id DESC LIMIT 500")
@@ -412,6 +429,50 @@ def api_keys_revoke(handler, kid, body):
     con.commit()
     con.close()
     return jdump({"ok": True})
+
+
+def api_keys_reset(handler, kid, body):
+    """owner/admin: unbind device (customer changed phone), re-activate a revoked
+    key, and/or top the expiry back up by N days."""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] == "reseller":
+        return jdump({"error": "resellers cannot reset keys"}, 403)
+    con = db()
+    row = con.execute("SELECT * FROM keys WHERE id=?", (kid,)).fetchone()
+    if row is None:
+        con.close()
+        return jdump({"error": "not found"}, 404)
+
+    actions = []
+    if body.get("unbind"):
+        con.execute("UPDATE keys SET device='' WHERE id=?", (kid,))
+        actions.append("device unbound")
+    if body.get("reactivate") and row["status"] != "active":
+        con.execute("UPDATE keys SET status='active' WHERE id=?", (kid,))
+        actions.append("re-activated")
+    try:
+        add_days = int(body.get("add_days", 0))
+    except Exception:
+        add_days = 0
+    if add_days:
+        if row["days"] == -1 or row["expires_at"] >= 0xFFFFFFFF:
+            actions.append("permanent key - expiry untouched")
+        else:
+            base = max(row["expires_at"], int(time.time()))
+            new_exp = base + add_days * 86400
+            con.execute("UPDATE keys SET expires_at=? WHERE id=?", (new_exp, kid))
+            actions.append(f"+{add_days}d added")
+    if body.get("note") is not None:
+        con.execute("UPDATE keys SET note=? WHERE id=?", ((body.get("note") or "")[:80], kid))
+        actions.append("note saved")
+    con.commit()
+    fresh = con.execute("SELECT * FROM keys WHERE id=?", (kid,)).fetchone()
+    con.close()
+    if not actions:
+        return jdump({"error": "nothing to do - pick an action"}, 400)
+    return jdump({"ok": True, "actions": actions, "key": dict(fresh)})
 
 
 # ───────────────────────── users ─────────────────────────
@@ -757,6 +818,10 @@ class Handler(BaseHTTPRequestHandler):
             kid = path.split("/")[3]
             status, hdr, resp = api_keys_revoke(self, kid, body)
             return self._send(status, hdr, resp)
+        if method == "POST" and path.startswith("/api/keys/") and path.endswith("/reset"):
+            kid = path.split("/")[3]
+            status, hdr, resp = api_keys_reset(self, kid, body)
+            return self._send(status, hdr, resp)
         if method == "POST" and path.startswith("/api/users/") and path.endswith("/ban"):
             uid = path.split("/")[3]
             status, hdr, resp = api_users_ban(self, uid, body)
@@ -800,7 +865,7 @@ def main():
     print("=" * 58)
     print("  YADAV CHEATS DASHBOARD v2")
     print(f"  http://localhost:{port}")
-    print("  owner login: owner / yadav123")
+    print("  owner login: owner / (OWNER_PASSWORD env)")
     if public:
         print(f"  apk endpoint: {public}/api/apk/verify")
     else:

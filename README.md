@@ -9,7 +9,11 @@ python dashboard\server.py          →  http://localhost:8080
 python dashboard\server.py 9090     →  custom port
 ```
 
-**Owner login:** `owner` / `yadav123`  *(change it in Settings after first login)*
+**Owner login:** `owner` / `9319989275` *(change it in Settings after first login)*
+
+> **Render pe deploy karte hi `OWNER_PASSWORD` env variable set karo** (value = apna password).
+> free plan pe sqlite har redeploy pe reset hota hai — env variable hi tab bhi naya owner
+> account usi password se banata hai. agar env set na ho to fallback `9319989275` hai.
 
 LAN (open from your phone browser): `http://YOUR-PC-IP:8080`
 
@@ -28,6 +32,7 @@ named `server.url` (contents = just the URL) into the app's private files dir, o
 |---|---|---|---|
 | Generate keys | free | free | spends balance |
 | Revoke keys | ✓ | ✓ | — |
+| **Reset keys** (unbind device • re-activate • add time) | ✓ | ✓ | — |
 | Create admins | ✓ | — | — |
 | Create resellers | ✓ | ✓ | — |
 | Top-up balance | ✓ | resellers only | — |

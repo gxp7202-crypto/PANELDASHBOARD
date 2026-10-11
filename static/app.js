@@ -154,7 +154,7 @@ async function showApp() {
   $("#appView").classList.remove("hidden");
   applyRole(ME.user.role);
   $("#uName").textContent = ME.user.username;
-  $("#uRole").textContent = ME.user.role;
+  $("#uRole").textContent = ME.user.role === "owner" ? "♛ " + ME.user.role : ME.user.role;
   $("#uAvatar").textContent = ME.user.username[0].toUpperCase();
   $("#uBal").textContent = ME.user.role === "reseller" ? fmtBal(ME.user.balance) : "∞";
   go(location.hash || "#/overview");
@@ -419,12 +419,60 @@ async function loadKeys() {
         <td>${esc(k.by)}</td>
         <td><div class="row-actions">
           <button class="btn btn-sm btn-blue" data-copy="${esc(k.display || k.key_code)}">COPY</button>
-          ${k.status === "active" && ME.user.role !== "reseller"
-            ? `<button class="btn btn-sm btn-red" data-revoke="${k.id}">REVOKE</button>` : ""}
+          ${ME.user.role !== "reseller"
+            ? `<button class="btn btn-sm btn-green" data-reset="${k.id}">RESET</button>
+               <button class="btn btn-sm btn-red" data-revoke="${k.id}">REVOKE</button>` : ""}
         </div></td>
       </tr>`).join("")}</tbody></table>`;
   bindCopy(box);
   $$("[data-revoke]", box).forEach(b => b.onclick = () => confirmRevoke(b.dataset.revoke));
+  $$("[data-reset]", box).forEach(b => b.onclick = () => openKeyReset(b.dataset.reset, rows));
+}
+
+function openKeyReset(id, rows) {
+  const k = rows.find(x => String(x.id) === String(id));
+  if (!k) return;
+  const perm = k.days === -1;
+  openModal(`
+    <h3>RESET KEY — ${esc(k.display || k.key_code)}</h3>
+    <div class="rk" style="margin-bottom:14px">
+      <span class="code">${esc(k.display || k.key_code)}</span>
+      <button class="copy-btn" data-copy="${esc(k.display || k.key_code)}">COPY</button>
+    </div>
+    <label class="chk"><input type="checkbox" id="rsUnbind" ${k.device ? "checked" : ""}>
+      <span>UNBIND DEVICE${k.device ? ` — currently <b style="color:var(--red)">${esc(k.device.slice(0, 14))}…</b>` : " — free"}</span></label>
+    <label class="chk"><input type="checkbox" id="rsReact" ${k.status !== "active" ? "checked" : ""}>
+      <span>RE-ACTIVATE${k.status !== "active" ? ` — currently <b style="color:var(--red)">REVOKED</b>` : " — already active"}</span></label>
+    <label class="chk"><input type="checkbox" id="rsAddChk">
+      <span>ADD TIME — extend expiry by:</span></label>
+    <select id="rsDays" ${perm ? "disabled" : ""}>
+      <option value="1">+1 day</option><option value="7">+7 days</option>
+      <option value="15">+15 days</option><option value="30" selected>+30 days</option>
+      <option value="60">+60 days</option>
+    </select>
+    ${perm ? `<div class="note">this is a PERMANENT key — time extension is disabled.</div>` : ""}
+    <div class="note" style="margin-top:12px">customer changed phone? <b>UNBIND</b> then they can
+    activate again. key revoked by mistake? <b>RE-ACTIVATE</b>. sold extra days? <b>ADD TIME</b>.</div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" data-close="1">CANCEL</button>
+      <button class="btn btn-green" id="rsGo">RESET KEY</button>
+    </div>`, box => {
+    bindCopy(box);
+    $("#rsGo", box).onclick = async () => {
+      const body = {
+        unbind: $("#rsUnbind", box).checked,
+        reactivate: $("#rsReact", box).checked,
+        add_days: $("#rsAddChk", box).checked ? parseInt($("#rsDays", box).value) : 0
+      };
+      if (!body.unbind && !body.reactivate && !body.add_days)
+        return toast("pick at least one action", "err");
+      const r = await api(`/api/keys/${id}/reset`, "POST", body);
+      if (r.error) return toast(r.error, "err");
+      closeModal();
+      toast("key reset — " + r.actions.join(", "), "gold");
+      loadKeys();
+    };
+  });
 }
 
 function confirmRevoke(id) {
@@ -720,7 +768,7 @@ PAGES.ledger = async () => {
 /* ───── settings ───── */
 PAGES.settings = () => {
   const el = $("#page");
-  const u = ME.user.role ? ME.user : ME.user;
+  const u = ME.user;
   el.innerHTML = `
     <div class="grid2">
       <div class="card">
