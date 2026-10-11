@@ -1,0 +1,2 @@
+# YADAV dashboard — zero dependencies, pure Python 3 stdlib
+# nothing to install here.
