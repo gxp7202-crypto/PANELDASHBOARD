@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YADAV CHEATS — Dashboard</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<canvas id="fx"></canvas>
+
+<!-- ═══════════ LOGIN ═══════════ -->
+<div id="loginView" class="view">
+  <div class="login-card glass pop-in">
+    <div class="logo-mark">Y</div>
+    <h1 class="grad-text">YADAV CHEATS</h1>
+    <p class="sub">LICENSE CONTROL CENTER &nbsp;•&nbsp; V1.0</p>
+    <form id="loginForm" autocomplete="off">
+      <label>USERNAME</label>
+      <input id="lgUser" type="text" placeholder="owner" required>
+      <label>PASSWORD</label>
+      <input id="lgPass" type="password" placeholder="••••••••" required>
+      <div id="lgErr" class="err-box"></div>
+      <button class="btn-gold" type="submit"><span>ENTER DASHBOARD</span></button>
+    </form>
+    <p class="fine">owner default: <b>owner / yadav123</b> — change it in settings</p>
+  </div>
+</div>
+
+<!-- ═══════════ APP SHELL ═══════════ -->
+<div id="appView" class="view hidden">
+
+  <aside class="sidebar glass">
+    <div class="brand">
+      <div class="logo-mark sm">Y</div>
+      <div>
+        <div class="brand-name">YADAV <span>CHEATS</span></div>
+        <div class="brand-sub">CONTROL CENTER</div>
+      </div>
+    </div>
+
+    <nav id="nav">
+      <a href="#/overview" data-page="overview" class="nav-item active">
+        <i>◆</i><span>Overview</span></a>
+      <a href="#/keys" data-page="keys" class="nav-item">
+        <i>❖</i><span>License Keys</span></a>
+      <a href="#/admins" data-page="admins" class="nav-item role-owner">
+        <i>★</i><span>Admins</span></a>
+      <a href="#/resellers" data-page="resellers" class="nav-item role-owner role-admin">
+        <i>♦</i><span>Resellers</span></a>
+      <a href="#/ledger" data-page="ledger" class="nav-item">
+        <i>▤</i><span>Balance Ledger</span></a>
+      <a href="#/settings" data-page="settings" class="nav-item">
+        <i>⚙</i><span>Settings</span></a>
+    </nav>
+
+    <div class="side-foot">
+      <div class="sync-pill"><span class="pulse-dot"></span> APK SYNC ACTIVE</div>
+      <div class="fine">YADAV-••• KEY FORMAT</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h2 id="pageTitle">Overview</h2>
+        <div class="sub" id="pageSub">live control panel</div>
+      </div>
+      <div class="top-right">
+        <div class="live-pill"><span class="pulse-dot"></span> LIVE <span id="clock">--:--:--</span></div>
+        <div class="user-chip glass">
+          <div class="avatar" id="uAvatar">Y</div>
+          <div>
+            <div class="u-name" id="uName">—</div>
+            <div class="u-role" id="uRole">—</div>
+          </div>
+          <div class="u-bal" id="uBal">0</div>
+        </div>
+        <button class="btn-ghost" id="btnLogout">LOGOUT</button>
+      </div>
+    </header>
+
+    <section id="page" class="page"></section>
+  </main>
+</div>
+
+<!-- ═══════════ MODALS ═══════════ -->
+<div id="modalRoot" class="modal-root hidden">
+  <div class="modal-back" data-close="1"></div>
+  <div class="modal glass pop-in" id="modalBox"></div>
+</div>
+
+<!-- ═══════════ TOASTS ═══════════ -->
+<div id="toasts"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
