@@ -320,6 +320,33 @@ nav{margin-top:16px;display:flex;flex-direction:column;gap:5px;flex:1}
   width:18px;height:18px;min-width:18px;padding:0;margin-top:1px;accent-color:var(--gold);cursor:pointer;
 }
 .modal select{margin-top:6px}
+
+/* ───────── v3: create-key wizard (product / days / random-custom / device / qty) ───────── */
+.step-note{
+  font-size:10px;letter-spacing:.22em;color:var(--gold);font-weight:700;
+  margin:18px 0 7px;padding-left:9px;border-left:2px solid var(--gold);
+}
+.step-note:first-of-type{margin-top:2px}
+.step-note span{color:var(--sub);letter-spacing:.1em;font-weight:400}
+.prod-row{display:flex;gap:9px;align-items:stretch}
+.prod-row select{flex:1;margin-top:0}
+.prod-row .btn{margin-top:0;align-self:center;white-space:nowrap}
+.prod-new{display:flex;gap:9px;margin-top:9px}
+.prod-new input{flex:1}
+.prod-new .btn{margin-top:0;white-space:nowrap}
+.mode-tabs{display:flex;gap:9px}
+.mtab{
+  flex:1;padding:11px 14px;border-radius:11px;border:1px solid var(--stroke);
+  background:#0E0E16;color:var(--sub);cursor:pointer;
+  font-size:12px;letter-spacing:.18em;font-weight:800;transition:all .2s;
+}
+.mtab:hover{border-color:rgba(255,208,38,.55);color:var(--text)}
+.mtab.sel{
+  background:linear-gradient(135deg,rgba(255,208,38,.22),rgba(255,208,38,.08));
+  border-color:var(--gold);color:var(--gold);box-shadow:0 0 20px rgba(255,208,38,.2);
+}
+#mkCount[disabled],input[disabled]{opacity:.55;cursor:not-allowed}
+.toolbar select#fProduct{min-width:160px}
 .otab{
   padding:9px 16px;border-radius:10px;border:1px solid var(--stroke);background:#0E0E16;
   color:var(--sub);cursor:pointer;font-size:11px;letter-spacing:.14em;font-weight:700;transition:all .2s;

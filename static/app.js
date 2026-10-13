@@ -341,7 +341,8 @@ PAGES.keys = async () => {
           <option value="revoked">REVOKED keys</option>
           <option value="all">ALL keys</option>
         </select>
-        <input id="fQ" placeholder="search key / note / user / device…">
+        <select id="fProduct"><option value="">ALL PRODUCTS</option></select>
+        <input id="fQ" placeholder="search key / note / user / device / product…">
         <div class="spacer"></div>
         <span class="count-badge" id="kCount"></span>
         <button class="btn btn-gold-sm" id="btnNewKey">+ CREATE KEYS</button>
@@ -349,6 +350,19 @@ PAGES.keys = async () => {
       <div id="kList"><div class="empty"><span class="spinner"></span></div></div>
     </div>`;
   applyRole(ME.user.role);
+
+  // product / project filter
+  api("/api/products").then(pr => {
+    const sel = $("#fProduct");
+    if (!sel) return;
+    (pr.products || []).forEach(p => {
+      const o = document.createElement("option");
+      o.value = p.name;
+      o.textContent = p.name + (p.key_count ? ` (${p.key_count})` : "");
+      sel.appendChild(o);
+    });
+    sel.onchange = loadKeys;
+  });
 
   $("#vBtn").onclick = async () => {
     const key = $("#vKey").value.trim();
@@ -390,7 +404,8 @@ async function loadKeys() {
   const box = $("#kList");
   if (!box) return;
   const st = $("#fStatus").value, q = $("#fQ").value.trim();
-  const r = await api(`/api/keys?status=${st}&q=${encodeURIComponent(q)}&origin=${KEY_ORIGIN}`);
+  const prod = $("#fProduct") ? $("#fProduct").value : "";
+  const r = await api(`/api/keys?status=${st}&q=${encodeURIComponent(q)}&origin=${KEY_ORIGIN}&product=${encodeURIComponent(prod)}`);
   if (r.error) { box.innerHTML = `<div class="empty">${esc(r.error)}</div>`; return; }
   const rows = r.keys;
   $("#kCount").textContent = rows.length + " shown";
@@ -405,12 +420,14 @@ async function loadKeys() {
   }
   box.innerHTML = `
     <table class="tbl"><thead><tr>
-      <th style="width:34%">KEY</th><th>PLAN</th><th>ORIGIN</th><th>EXPIRES</th>
+      <th style="width:30%">KEY</th><th>PRODUCT</th><th>PLAN</th><th>ORIGIN</th><th>EXPIRES</th>
       <th>DEVICE</th><th>STATUS</th><th>BY</th><th>ACTIONS</th></tr></thead>
     <tbody>${rows.map((k, i) => `
       <tr style="animation-delay:${Math.min(i, 14) * 40}ms">
         <td><span class="kc">${esc(k.display || k.key_code)}</span>
           ${k.note ? `<div class="sub" style="letter-spacing:0;margin-top:3px">${esc(k.note)}</div>` : ""}</td>
+        <td>${k.product ? `<span class="badge badge-blue">${esc(k.product)}</span>`
+                        : `<span class="badge badge-gray">—</span>`}</td>
         <td><span class="badge badge-gray">${durTag(k.days)}</span></td>
         <td>${originBadge(k.created_by_role)}</td>
         <td class="mono">${fmtDate(k.expires_at)}</td>
@@ -492,16 +509,32 @@ function confirmRevoke(id) {
   });
 }
 
-function openCreateKey() {
+async function openCreateKey() {
   const presets = ME.presets;
   const costs = ME.costs;
   const role = ME.user.role;
   let sel = 30;
+  let mode = "random";                 // random | custom
+
+  // product / project list (ROOT AIM SILENT, SELF BOT EXE, …)
+  const pr = await api("/api/products");
+  let products = (pr.products || []).map(p => p.name);
+  const prodOpts = (chosen) => `<option value="">— no product —</option>` +
+    products.map(p => `<option value="${esc(p)}" ${p === chosen ? "selected" : ""}>${esc(p)}</option>`).join("");
+
   openModal(`
     <h3>CREATE LICENSE KEYS</h3>
-    <div class="note" style="margin:0 0 14px">you are <b style="color:var(--gold)">${role.toUpperCase()}</b> —
-    keys you make here get tagged <b style="color:var(--gold)">${role.toUpperCase()} KEY</b> in every list.</div>
-    <label>DURATION</label>
+    <div class="step-note">1 — SELECT PRODUCT / PROJECT</div>
+    <div class="prod-row">
+      <select id="mkProduct">${prodOpts(products[0] || "")}</select>
+      <button class="btn btn-sm btn-blue" id="mkAddProd" type="button">+ ADD</button>
+    </div>
+    <div class="prod-new hidden" id="prodNew">
+      <input id="mkNewProd" maxlength="48" placeholder="new product name…" spellcheck="false">
+      <button class="btn btn-sm btn-green" id="mkSaveProd" type="button">SAVE</button>
+    </div>
+
+    <div class="step-note">2 — KEY DURATION</div>
     <div class="chips" id="chips">
       ${presets.map(d => `
         <div class="chip ${d === sel ? "sel" : ""}" data-d="${d}">
@@ -509,14 +542,33 @@ function openCreateKey() {
           <div class="c">${role === "reseller" ? costs[d] + " cr" : "free"}</div>
         </div>`).join("")}
     </div>
-    <label>HOW MANY (1-100)</label>
+
+    <div class="step-note">3 — KEY TYPE</div>
+    <div class="mode-tabs" id="modeTabs">
+      <button class="mtab sel" data-m="random" type="button">RANDOM</button>
+      <button class="mtab" data-m="custom" type="button">CUSTOM</button>
+    </div>
+    <div id="customBox" class="hidden">
+      <label>CUSTOM KEY — 8 LETTERS, A–Z ONLY (NO I / L / O)</label>
+      <input id="mkCustom" maxlength="8" placeholder="XYNPUTWJ" spellcheck="false"
+             style="text-transform:uppercase;font-family:Consolas,monospace;letter-spacing:.2em">
+      <div class="note" style="margin-top:7px">the key will be
+        <b style="color:var(--gold)" id="customPrev">YADAV-••••••••-${durTag(sel)}</b> — unique, cannot be made twice.</div>
+    </div>
+
+    <div class="step-note">4 — DEVICE ID <span style="color:var(--sub)">(optional — pre-lock)</span></div>
+    <input id="mkDevice" maxlength="64" placeholder="leave empty → first phone to activate binds it"
+           spellcheck="false">
+
+    <div class="step-note">5 — QUANTITY</div>
     <input id="mkCount" type="number" min="1" max="100" value="1">
+
     <label>NOTE (optional — sold to…)</label>
     <input id="mkNote" maxlength="80" placeholder="e.g. sold to rahul on whatsapp">
     <div class="note" id="mkCost"></div>
     <div class="modal-actions">
       <button class="btn btn-ghost" data-close="1">CANCEL</button>
-      <button class="btn btn-gold-sm" id="mkGo">GENERATE KEYS</button>
+      <button class="btn btn-gold-sm" id="mkGo">CREATE &amp; COPY</button>
     </div>`, box => {
     const upd = () => {
       const n = Math.max(1, Math.min(100, parseInt($("#mkCount", box).value) || 1));
@@ -525,32 +577,91 @@ function openCreateKey() {
         ? `cost: <b style="color:var(--gold)">${unit * n} credits</b> — your balance: <b style="color:var(--green)">${fmtBal(ME.user.balance)}</b>`
         : `this key type is <b style="color:var(--green)">free</b> for ${role}s`;
     };
+
+    const updCustom = () => {
+      const inp = $("#mkCustom", box);
+      const v = (inp.value || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 8);
+      inp.value = v;
+      const prev = $("#customPrev", box);
+      if (prev) {
+        const ok = v.length === 8;
+        prev.textContent = ok ? `YADAV-${v}-${durTag(sel)}` : `YADAV-••••••••-${durTag(sel)}`;
+        prev.style.color = ok ? "var(--gold)" : "var(--sub)";
+      }
+      const cnt = $("#mkCount", box);
+      cnt.value = 1;                    // custom keys are 1-of-a-kind
+      cnt.disabled = mode === "custom";
+    };
+
+    const setMode = (m) => {
+      mode = m;
+      $$(".mtab", box).forEach(x => x.classList.toggle("sel", x.dataset.m === m));
+      $("#customBox", box).classList.toggle("hidden", m !== "custom");
+      $("#mkCount", box).disabled = (m === "custom");
+      if (m === "custom") updCustom();
+      upd();
+    };
+
     $$(".chip", box).forEach(c => c.onclick = () => {
       $$(".chip", box).forEach(x => x.classList.remove("sel"));
       c.classList.add("sel"); sel = parseInt(c.dataset.d); upd();
+      if (mode === "custom") updCustom();
     });
+    $$(".mtab", box).forEach(b => b.onclick = () => setMode(b.dataset.m));
     $("#mkCount", box).oninput = upd;
-    upd();
+    $("#mkCustom", box).oninput = updCustom;
+
+    // + ADD product / project
+    $("#mkAddProd", box).onclick = () => {
+      const w = $("#prodNew", box);
+      w.classList.toggle("hidden");
+      if (!w.classList.contains("hidden")) $("#mkNewProd", box).focus();
+    };
+    $("#mkSaveProd", box).onclick = async () => {
+      const name = ($("#mkNewProd", box).value || "").trim();
+      if (name.length < 2) return toast("product name too short", "err");
+      const r = await api("/api/products", "POST", { name });
+      if (r.error) return toast(r.error, "err");
+      products.push(r.name);
+      products.sort();
+      $("#mkProduct", box).innerHTML = prodOpts(r.name);
+      $("#mkNewProd", box).value = "";
+      $("#prodNew", box).classList.add("hidden");
+      toast("product added — " + r.name, "gold");
+    };
+
+    upd(); setMode("random");
+
     $("#mkGo", box).onclick = async () => {
       const btn = $("#mkGo", box);
+      const custom = ($("#mkCustom", box).value || "").trim().toUpperCase();
+      if (mode === "custom" && custom.length !== 8)
+        return toast("custom key must be exactly 8 letters", "err");
       btn.disabled = true; btn.innerHTML = `<span class="spinner"></span>`;
       const r = await api("/api/keys", "POST", {
-        days: sel, count: parseInt($("#mkCount", box).value) || 1,
-        note: $("#mkNote", box).value
+        days: sel,
+        count: parseInt($("#mkCount", box).value) || 1,
+        note: $("#mkNote", box).value,
+        mode,
+        custom,
+        product: $("#mkProduct", box).value,
+        device: ($("#mkDevice", box).value || "").trim()
       });
-      btn.disabled = false; btn.textContent = "GENERATE KEYS";
+      btn.disabled = false; btn.innerHTML = "CREATE &amp; COPY";
       if (r.error) return toast(r.error, "err");
       if (r.cost && role === "reseller") { ME.user.balance -= r.cost; $("#uBal").textContent = fmtBal(ME.user.balance); }
-      showKeyResult(r.keys, sel);
-      toast(r.keys.length + " key(s) generated", "gold");
+      copyText(r.keys.join("\n"));          // CREATE & COPY → straight to clipboard
+      showKeyResult(r.keys, sel, r.product);
+      toast(r.keys.length + " key(s) created + copied", "gold");
       if ($("#kList")) loadKeys();
     };
   });
 }
 
-function showKeyResult(keys, days) {
+function showKeyResult(keys, days, product) {
   $("#modalBox").innerHTML = `
-    <h3>${keys.length} KEY${keys.length > 1 ? "S" : ""} READY — ${fmtDays(days)}</h3>
+    <h3>${keys.length} KEY${keys.length > 1 ? "S" : ""} READY — ${fmtDays(days)}${product ? " • " + esc(product) : ""}</h3>
+    <div class="note" style="margin-top:-8px;color:var(--green)">✓ copied to clipboard</div>
     <div class="result-keys">
       ${keys.map((k, i) => `
         <div class="rk" style="animation-delay:${i * 70}ms">

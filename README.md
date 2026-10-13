@@ -44,6 +44,39 @@ named `server.url` (contents = just the URL) into the app's private files dir, o
 - admin can **only** create resellers — never another admin
 - owner can delete admins and resellers; deleted account's keys are revoked instantly
 
+## Create keys — 5 step wizard
+
+`License Keys → + CREATE KEYS` opens the wizard:
+
+1. **SELECT PRODUCT / PROJECT** — pick from the list (`ROOT AIM SILENT`, `SELF BOT EXE`, …)
+   or hit **+ ADD** to register a new product on the spot.
+2. **KEY DURATION** — 1D / 7D / 15D / 30D / 60D / PERM.
+3. **KEY TYPE** — `RANDOM` (auto-generated, quantity up to 100) or `CUSTOM`
+   (you type the 8 letters yourself, e.g. `XYNPUTWJ`). Custom keys must be 8 chars
+   from the APK alphabet (**A–Z, no I / L / O**) and are enforced unique, so quantity
+   is locked to 1. The full key previews live as you type.
+4. **DEVICE ID** *(optional)* — pre-lock the key to one device. Leave empty and the
+   first phone to activate binds it (existing behaviour).
+5. **QUANTITY** — 1–100 (random mode only).
+
+**CREATE & COPY** mints the keys, writes them to the DB and **copies them straight to
+your clipboard**; the result dialog keeps per-key COPY, COPY ALL and DOWNLOAD .TXT.
+
+Every key stores its product — the keys table shows a **PRODUCT** column, the toolbar
+gains an **ALL PRODUCTS** filter, and the search box matches product names too.
+
+### API
+
+```
+GET  /api/products          → {products:[{id,name,key_count,created_at}]}
+POST /api/products {name}   → add a product (owner/admin only)
+POST /api/keys {days,count,note,mode:"random"|"custom",custom,product,device}
+GET  /api/keys?status=&q=&origin=&product=   → list, filterable by product
+```
+
+`data/dashboard.db` migrates automatically — the `products` table and `keys.product`
+column are created/seeded on first boot (`INSERT OR IGNORE`, so existing DBs are safe).
+
 ## Key format
 
 ```

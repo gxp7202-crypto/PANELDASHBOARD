@@ -34,6 +34,9 @@ DB_PATH = os.path.join(DATA, "dashboard.db")
 
 PBKDF2_ITERS = 100_000
 
+# products / projects a key can be issued for — seeded into the `products` table
+DEFAULT_PRODUCTS = ["ROOT AIM SILENT", "SELF BOT EXE"]
+
 # owner bootstrap password: OWNER_PASSWORD env wins, otherwise the fallback below.
 # NOTE: on Render free tier the sqlite file resets on every redeploy, so set the
 # OWNER_PASSWORD env var there — otherwise the fresh owner account reopens with
@@ -80,6 +83,7 @@ def init_db():
         created_by INTEGER NOT NULL,
         created_by_role TEXT NOT NULL DEFAULT 'admin',
         note TEXT DEFAULT '',
+        product TEXT DEFAULT '',
         status TEXT NOT NULL DEFAULT 'active',
         device TEXT DEFAULT '',
         last_seen INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +105,12 @@ def init_db():
         first_seen INTEGER NOT NULL,
         last_seen INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        created_by INTEGER,
+        created_at INTEGER NOT NULL
+    );
     """)
     # migrate: creator-role column for old dbs
     cols = [r[1] for r in con.execute("PRAGMA table_info(keys)")]
@@ -110,6 +120,13 @@ def init_db():
         con.execute("ALTER TABLE keys ADD COLUMN device TEXT DEFAULT ''")
     if "last_seen" not in cols:
         con.execute("ALTER TABLE keys ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0")
+    if "product" not in cols:
+        con.execute("ALTER TABLE keys ADD COLUMN product TEXT DEFAULT ''")
+
+    # seed the default product / project list (idempotent)
+    for _p in DEFAULT_PRODUCTS:
+        con.execute("INSERT OR IGNORE INTO products (name, created_by, created_at)"
+                    " VALUES (?,NULL,?)", (_p, int(time.time())))
 
     row = con.execute("SELECT * FROM users WHERE role='owner'").fetchone()
     if row is None:
@@ -321,6 +338,7 @@ def api_keys_list(handler, qs, body):
     status = qs.get("status", ["active"])[0]
     q = (qs.get("q", [""])[0] or "").strip()
     origin = (qs.get("origin", ["all"])[0] or "all")   # all | admin | reseller | owner
+    product = (qs.get("product", [""])[0] or "").strip()
     con = db()
     where, params = [], []
     if u["role"] == "reseller":
@@ -332,12 +350,15 @@ def api_keys_list(handler, qs, body):
     if origin in ("admin", "reseller", "owner"):
         where.append("k.created_by_role=?")
         params.append(origin)
+    if product:
+        where.append("k.product=?")
+        params.append(product)
     if q:
         disp = ("k.key_code || '-' || CASE k.days WHEN -1 THEN 'PERM'"
                 " ELSE CAST(k.days AS TEXT) || 'D' END")
         where.append(f"({disp} LIKE ? OR k.key_code LIKE ? OR k.note LIKE ?"
-                     " OR u.username LIKE ? OR k.device LIKE ?)")
-        params += [f"%{q}%"] * 5
+                     " OR u.username LIKE ? OR k.device LIKE ? OR k.product LIKE ?)")
+        params += [f"%{q}%"] * 6
     sql = ("SELECT k.*, u.username AS by FROM keys k JOIN users u ON u.id=k.created_by"
            + (" WHERE " + " AND ".join(where) if where else "")
            + " ORDER BY k.id DESC LIMIT 500")
@@ -377,12 +398,46 @@ def api_keys_create(handler, body):
         return jdump({"error": "invalid duration"}, 400)
     if count < 1 or count > 100:
         return jdump({"error": "count must be 1-100"}, 400)
+
+    mode = (body.get("mode") or "random").strip().lower()   # random | custom
+    if mode not in ("random", "custom"):
+        return jdump({"error": "mode must be random or custom"}, 400)
+    product = " ".join((body.get("product") or "").split())[:48]
+    device = (body.get("device") or "").strip()[:64]
     note = (body.get("note") or "")[:80]
+    custom_raw = (body.get("custom") or "").strip()
+
+    # custom key: user types the 8-letter body themselves (APK-safe alphabet)
+    custom_code = ""
+    if mode == "custom":
+        if count != 1:
+            return jdump({"error": "custom key: quantity must be 1"}, 400)
+        body8 = lc.normalize(custom_raw)                 # strips spaces, uppercases
+        if body8.startswith(lc.PREFIX):
+            body8 = body8[len(lc.PREFIX):]
+        if "-" in body8:                                 # tolerate a pasted full key
+            body8 = body8.rpartition("-")[0]
+        if len(body8) != 8:
+            return jdump({"error": "custom key must be exactly 8 characters"}, 400)
+        bad = [c for c in body8 if c not in lc.ALPHABET]
+        if bad:
+            return jdump({"error": "only A-Z allowed (no I / L / O), got: "
+                                   + " ".join(sorted(set(bad)))}, 400)
+        custom_code = lc.PREFIX + body8
+
     unit = lc.cost_of(days)
     total_cost = unit * count if u["role"] == "reseller" else 0
 
     con = db()
     row = None
+    if custom_code:
+        dup = con.execute("SELECT id FROM keys WHERE key_code=?", (custom_code,)).fetchone()
+        if dup:
+            con.close()
+            return jdump({"error": "that custom key already exists"}, 400)
+    if product:
+        con.execute("INSERT OR IGNORE INTO products (name, created_by, created_at)"
+                    " VALUES (?,?,?)", (product, u["id"], int(time.time())))
     if total_cost:
         row = con.execute("SELECT balance FROM users WHERE id=?", (u["id"],)).fetchone()
         if row is None or row["balance"] < total_cost:
@@ -393,12 +448,16 @@ def api_keys_create(handler, body):
     made, now = [], int(time.time())
     expires = 0xFFFFFFFF if days == -1 else now + days * 86400
     for _ in range(count):
-        full = lc.make_key(days)                 # YADAV-XXXXXXXX-DUR
-        code, _ = lc.parse(full)                 # store the bare code
+        if mode == "custom":
+            code = custom_code
+            full = code + "-" + lc.dur_tag(days)
+        else:
+            full = lc.make_key(days)                     # YADAV-XXXXXXXX-DUR
+            code, _ = lc.parse(full)                     # store the bare code
         con.execute(
             "INSERT INTO keys (key_code, days, expires_at, serial, created_by, created_by_role,"
-            " note, status, created_at) VALUES (?,?,?,?,?,?,?,'active',?)",
-            (code, days, expires, 0, u["id"], u["role"], note, now))
+            " note, product, device, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,'active',?)",
+            (code, days, expires, 0, u["id"], u["role"], note, product, device, now))
         made.append(full)
 
     if total_cost:
@@ -408,10 +467,45 @@ def api_keys_create(handler, body):
             "INSERT INTO ledger (user_id, delta, balance_after, reason, by_user, created_at)"
             " VALUES (?,?,?,?,?,?)",
             (u["id"], -total_cost, after,
-             f"key {count}x {lc.dur_tag(days)}", u["id"], now))
+             f"key {count}x {lc.dur_tag(days)}" + (f" {product}" if product else ""),
+             u["id"], now))
     con.commit()
     con.close()
-    return jdump({"ok": True, "keys": made, "cost": total_cost})
+    return jdump({"ok": True, "keys": made, "cost": total_cost, "mode": mode,
+                  "product": product, "device": device})
+
+
+def api_products_list(handler, qs, body):
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    con = db()
+    rows = [dict(r) for r in con.execute(
+        "SELECT p.id, p.name, p.created_at,"
+        " (SELECT COUNT(*) FROM keys k WHERE k.product = p.name) AS key_count"
+        " FROM products p ORDER BY p.name")]
+    con.close()
+    return jdump({"products": rows, "role": u["role"]})
+
+
+def api_products_create(handler, body):
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] == "reseller":
+        return jdump({"error": "resellers cannot add products"}, 403)
+    name = " ".join((body.get("name") or "").split())[:48]
+    if len(name) < 2:
+        return jdump({"error": "product name too short"}, 400)
+    con = db()
+    if con.execute("SELECT id FROM products WHERE name=? COLLATE NOCASE", (name,)).fetchone():
+        con.close()
+        return jdump({"error": "product already exists"}, 400)
+    con.execute("INSERT INTO products (name, created_by, created_at) VALUES (?,?,?)",
+                (name, u["id"], int(time.time())))
+    con.commit()
+    con.close()
+    return jdump({"ok": True, "name": name})
 
 
 def api_keys_revoke(handler, kid, body):
@@ -708,7 +802,6 @@ def normalize_key(raw):
 def api_apk_ping(handler, qs):
     return jdump({"ok": True, "server_time": int(time.time())})
 
-
 def api_verify_key(handler, qs):
     """dashboard-side check (mirrors the apk flow)"""
     code = qs.get("key", [""])[0]
@@ -760,6 +853,8 @@ ROUTES = {
     ("GET", "/api/overview"):  lambda h, b, q: api_overview(h, b),
     ("GET", "/api/keys"):      lambda h, b, q: api_keys_list(h, q, b),
     ("POST", "/api/keys"):     lambda h, b, q: api_keys_create(h, b),
+    ("GET", "/api/products"):  lambda h, b, q: api_products_list(h, q, b),
+    ("POST", "/api/products"): lambda h, b, q: api_products_create(h, b),
     ("GET", "/api/ledger"):    lambda h, b, q: api_ledger(h, q),
     ("GET", "/api/users"):     lambda h, b, q: api_users_list(h, q),
     ("POST", "/api/users"):    lambda h, b, q: api_users_create(h, b),
