@@ -29,6 +29,10 @@ PERM_EPOCH = 0xFFFFFFFF
 # no I / L / O — nothing anyone can misread over whatsapp
 ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ"
 
+# custom keys: whatever the owner types IS the key (1-40 chars)
+CUSTOM_MAX = 40
+CUSTOM_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+
 DAY_PRESETS = [1, 7, 15, 30, 60, -1]        # -1 = PERMANENT
 DUR_TAG = {1: "1D", 7: "7D", 15: "15D", 30: "30D", 60: "60D", -1: "PERM"}
 TAG_DUR = {v: k for k, v in DUR_TAG.items()}
@@ -54,6 +58,17 @@ def make_key(days: int) -> str:
 
 def normalize(key: str) -> str:
     return (key or "").strip().replace(" ", "").upper()
+
+
+def normalize_custom(key: str):
+    """custom key = the exact string the owner typed (1-40 chars, A-Z 0-9 - _).
+    returns the normalized key or None if it can't be a custom key."""
+    k = (key or "").strip().replace(" ", "").upper()
+    if not k or len(k) > CUSTOM_MAX:
+        return None
+    if any(c not in CUSTOM_ALPHABET for c in k):
+        return None
+    return k
 
 
 def parse(key: str):

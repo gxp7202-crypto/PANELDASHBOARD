@@ -33,6 +33,8 @@ DATA = os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA, "dashboard.db")
 
 PBKDF2_ITERS = 100_000
+VERSION = "2.1"
+STARTED_AT = time.time()
 
 # products / projects a key can be issued for — seeded into the `products` table
 DEFAULT_PRODUCTS = ["ROOT AIM SILENT", "SELF BOT EXE"]
@@ -87,6 +89,8 @@ def init_db():
         status TEXT NOT NULL DEFAULT 'active',
         device TEXT DEFAULT '',
         last_seen INTEGER NOT NULL DEFAULT 0,
+        custom INTEGER NOT NULL DEFAULT 0,
+        device_limit INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS ledger (
@@ -127,6 +131,13 @@ def init_db():
     for _p in DEFAULT_PRODUCTS:
         con.execute("INSERT OR IGNORE INTO products (name, created_by, created_at)"
                     " VALUES (?,NULL,?)", (_p, int(time.time())))
+    if "custom" not in cols:
+        con.execute("ALTER TABLE keys ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
+    if "device_limit" not in cols:
+        # old keys behaved as 1-device locks, so keep that as the default
+        con.execute("ALTER TABLE keys ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 1")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_devices_key ON devices(key_code)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_keys_created ON keys(created_at)")
 
     row = con.execute("SELECT * FROM users WHERE role='owner'").fetchone()
     if row is None:
@@ -201,6 +212,19 @@ def can_see_user(actor, target_role, target_id=None):
     return False
 
 
+def day_start(ts: int) -> int:
+    return ts - ts % 86400
+
+
+def clamp_device_limit(v, default=1):
+    """0 = unlimited, else 1-50 phones"""
+    try:
+        n = int(v)
+    except Exception:
+        return default
+    return 0 if n <= 0 else max(1, min(50, n))
+
+
 # ───────────────────────── auth api ─────────────────────────
 
 def api_login(handler, body):
@@ -254,7 +278,7 @@ def api_me(handler, body):
     return jdump({"user": public_user(u), "my_active_keys": mine,
                   "presets": lc.DAY_PRESETS,
                   "costs": {str(d): lc.cost_of(d) for d in lc.DAY_PRESETS},
-                  "key_format": "YADAV-••••••••-1D"})
+                  "key_format": "YADAV-••••••••-1D  ya  CUSTOM (jo type karo wahi key)"})
 
 
 def api_password(handler, body):
@@ -287,6 +311,7 @@ def api_overview(handler, body):
     if not u:
         return jdump({"error": "unauthorized"}, 401)
     con = db()
+    now = int(time.time())
     one = lambda q, p=(): (con.execute(q, p).fetchone()[0] or 0)
     me_where, me_p = ("", ()) if u["role"] == "owner" else (" WHERE k.created_by=?", (u["id"],))
     scope = "" if u["role"] == "owner" else " AND created_by=?"
@@ -305,6 +330,8 @@ def api_overview(handler, body):
         "resellers": one("SELECT COUNT(*) FROM users WHERE role='reseller'"),
         "resellers_banned": one("SELECT COUNT(*) FROM users WHERE role='reseller' AND banned=1"),
         "balance_total": one("SELECT COALESCE(SUM(balance),0) FROM users WHERE role='reseller'"),
+        "keys_today": one("SELECT COUNT(*) FROM keys WHERE created_at >= ?", (day_start(now),)),
+        "devices_total": one("SELECT COUNT(*) FROM devices"),
     }
     if u["role"] == "reseller":
         stats.update({
@@ -325,8 +352,25 @@ def api_overview(handler, body):
         "SELECT l.*, u.username AS who, b.username AS byname FROM ledger l"
         " JOIN users u ON u.id=l.user_id JOIN users b ON b.id=l.by_user"
         " ORDER BY l.id DESC LIMIT 8")]
+    # 7-day key creation activity for the overview chart
+    first = day_start(now) - 6 * 86400
+    made_per_day = {r[0]: r[1] for r in con.execute(
+        "SELECT (created_at/86400)*86400 AS d, COUNT(*) FROM keys"
+        " WHERE created_by=? AND created_at >= ? GROUP BY d" if u["role"] == "reseller"
+        else "SELECT (created_at/86400)*86400 AS d, COUNT(*) FROM keys"
+             " WHERE created_at >= ? GROUP BY d",
+        (u["id"], first) if u["role"] == "reseller" else (first,))}
+    activity = [{"day": d, "n": made_per_day.get(d, 0)}
+                for d in range(first, day_start(now) + 1, 86400)]
     con.close()
-    return jdump({"stats": stats, "recent_keys": recent_keys, "recent_ledger": recent_ledger})
+    sysinfo = {
+        "version": VERSION,
+        "uptime": int(now - STARTED_AT),
+        "db_kb": (os.path.getsize(DB_PATH) // 1024) if os.path.exists(DB_PATH) else 0,
+        "python": sys.version.split()[0],
+    }
+    return jdump({"stats": stats, "recent_keys": recent_keys,
+                  "recent_ledger": recent_ledger, "activity": activity, "sys": sysinfo})
 
 
 # ───────────────────────── keys ─────────────────────────
@@ -359,13 +403,16 @@ def api_keys_list(handler, qs, body):
         where.append(f"({disp} LIKE ? OR k.key_code LIKE ? OR k.note LIKE ?"
                      " OR u.username LIKE ? OR k.device LIKE ? OR k.product LIKE ?)")
         params += [f"%{q}%"] * 6
-    sql = ("SELECT k.*, u.username AS by FROM keys k JOIN users u ON u.id=k.created_by"
+    sql = ("SELECT k.*, u.username AS by,"
+           " (SELECT COUNT(DISTINCT device_id) FROM devices d WHERE d.key_code=k.key_code)"
+           " AS device_count FROM keys k JOIN users u ON u.id=k.created_by"
            + (" WHERE " + " AND ".join(where) if where else "")
            + " ORDER BY k.id DESC LIMIT 500")
     rows = []
     for r in con.execute(sql, params):
         d = dict(r)
-        d["display"] = d["key_code"] + "-" + lc.dur_tag(d["days"])
+        d["display"] = (d["key_code"] if d.get("custom")
+                        else d["key_code"] + "-" + lc.dur_tag(d["days"]))
         rows.append(d)
     counts = {
         "all": con.execute("SELECT COUNT(*) FROM keys" + (
@@ -405,36 +452,23 @@ def api_keys_create(handler, body):
     product = " ".join((body.get("product") or "").split())[:48]
     device = (body.get("device") or "").strip()[:64]
     note = (body.get("note") or "")[:80]
-    custom_raw = (body.get("custom") or "").strip()
+    devlim = clamp_device_limit(body.get("device_limit", 1))
 
-    # custom key: user types the 8-letter body themselves (APK-safe alphabet)
-    custom_code = ""
+    # custom key = the EXACT text the owner types (1-40 chars, A-Z 0-9 - _)
+    custom = None
     if mode == "custom":
-        if count != 1:
-            return jdump({"error": "custom key: quantity must be 1"}, 400)
-        body8 = lc.normalize(custom_raw)                 # strips spaces, uppercases
-        if body8.startswith(lc.PREFIX):
-            body8 = body8[len(lc.PREFIX):]
-        if "-" in body8:                                 # tolerate a pasted full key
-            body8 = body8.rpartition("-")[0]
-        if len(body8) != 8:
-            return jdump({"error": "custom key must be exactly 8 characters"}, 400)
-        bad = [c for c in body8 if c not in lc.ALPHABET]
-        if bad:
-            return jdump({"error": "only A-Z allowed (no I / L / O), got: "
-                                   + " ".join(sorted(set(bad)))}, 400)
-        custom_code = lc.PREFIX + body8
+        raw_custom = (body.get("custom") or body.get("custom_key") or "")
+        custom = lc.normalize_custom(raw_custom)
+        if not custom:
+            return jdump({"error": "custom key must be 1-40 chars — only A-Z 0-9 - _ "
+                                   "(spaces are removed)"}, 400)
+        count = 1     # a custom key is unique, no bulk generation
 
     unit = lc.cost_of(days)
     total_cost = unit * count if u["role"] == "reseller" else 0
 
     con = db()
     row = None
-    if custom_code:
-        dup = con.execute("SELECT id FROM keys WHERE key_code=?", (custom_code,)).fetchone()
-        if dup:
-            con.close()
-            return jdump({"error": "that custom key already exists"}, 400)
     if product:
         con.execute("INSERT OR IGNORE INTO products (name, created_by, created_at)"
                     " VALUES (?,?,?)", (product, u["id"], int(time.time())))
@@ -447,18 +481,30 @@ def api_keys_create(handler, body):
 
     made, now = [], int(time.time())
     expires = 0xFFFFFFFF if days == -1 else now + days * 86400
-    for _ in range(count):
-        if mode == "custom":
-            code = custom_code
-            full = code + "-" + lc.dur_tag(days)
+    try:
+        if custom:
+            if con.execute("SELECT 1 FROM keys WHERE key_code=?", (custom,)).fetchone():
+                con.close()
+                return jdump({"error": f'key "{custom}" already exists'}, 400)
+            con.execute(
+                "INSERT INTO keys (key_code, days, expires_at, serial, created_by, created_by_role,"
+                " note, product, device, status, custom, device_limit, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,'active',1,?,?)",
+                (custom, days, expires, 0, u["id"], u["role"], note, product, device, devlim, now))
+            made.append(custom)
         else:
-            full = lc.make_key(days)                     # YADAV-XXXXXXXX-DUR
-            code, _ = lc.parse(full)                     # store the bare code
-        con.execute(
-            "INSERT INTO keys (key_code, days, expires_at, serial, created_by, created_by_role,"
-            " note, product, device, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,'active',?)",
-            (code, days, expires, 0, u["id"], u["role"], note, product, device, now))
-        made.append(full)
+            for _ in range(count):
+                full = lc.make_key(days)             # YADAV-XXXXXXXX-DUR
+                code, _ = lc.parse(full)             # store the bare code
+                con.execute(
+                    "INSERT INTO keys (key_code, days, expires_at, serial, created_by,"
+                    " created_by_role, note, product, device, status, device_limit, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,'active',?,?)",
+                    (code, days, expires, 0, u["id"], u["role"], note, product, device, devlim, now))
+                made.append(full)
+    except sqlite3.IntegrityError:
+        con.close()
+        return jdump({"error": "key already exists"}, 400)
 
     if total_cost:
         after = row["balance"] - total_cost
@@ -541,8 +587,15 @@ def api_keys_reset(handler, kid, body):
 
     actions = []
     if body.get("unbind"):
+        # wipe every bound device so the customer can activate on a fresh phone
+        con.execute("DELETE FROM devices WHERE key_code=?", (row["key_code"],))
         con.execute("UPDATE keys SET device='' WHERE id=?", (kid,))
         actions.append("device unbound")
+    if body.get("device_limit") is not None:
+        devlim = clamp_device_limit(body.get("device_limit"), default=None)
+        if devlim is not None:
+            con.execute("UPDATE keys SET device_limit=? WHERE id=?", (devlim, kid))
+            actions.append("device limit → " + ("∞" if devlim == 0 else str(devlim)))
     if body.get("reactivate") and row["status"] != "active":
         con.execute("UPDATE keys SET status='active' WHERE id=?", (kid,))
         actions.append("re-activated")
@@ -747,9 +800,20 @@ def api_apk_verify(handler, qs):
     raw = (qs.get("key", [""])[0] or "")
     device = (qs.get("device", [""])[0] or "")[:64]
     code, days = lc.parse(raw)
+    now = int(time.time())
+    con = db()
 
-    # legacy offline-signed formats still honor (old customers)
-    if code is None:
+    # standard YADAV-XXXXXXXX-DUR key first
+    row = con.execute("SELECT * FROM keys WHERE key_code=?", (code,)).fetchone() if code else None
+    # then a custom key — the exact text the owner typed (any length, any case)
+    if row is None:
+        ckey = lc.normalize_custom(raw)
+        if ckey and ckey != code:
+            row = con.execute("SELECT * FROM keys WHERE key_code=?", (ckey,)).fetchone()
+
+    if row is None:
+        con.close()
+        # legacy offline-signed formats still honor (old customers)
         leg = lc.verify_legacy(raw)
         if leg.get("ok"):
             return jdump({"ok": True, "legacy": True, "expires": leg["expires"],
@@ -760,38 +824,51 @@ def api_apk_verify(handler, qs):
                           "receipt": ""})
         return jdump({"ok": False, "reason": "invalid key"}, 200)
 
-    now = int(time.time())
-    con = db()
-    row = con.execute("SELECT * FROM keys WHERE key_code=?", (code,)).fetchone()
-    if row is None:
-        con.close()
-        return jdump({"ok": False, "reason": "key not found"}, 200)
     if row["status"] != "active":
         con.close()
         return jdump({"ok": False, "reason": "revoked"}, 200)
 
-    # device lock: first phone to use a key owns it
-    if device:
-        if row["device"] and row["device"] != device:
-            con.close()
-            return jdump({"ok": False, "reason": "key bound to another device"}, 200)
-        if not row["device"]:
-            con.execute("UPDATE keys SET device=? WHERE id=?", (device, row["id"]))
-        con.execute("UPDATE keys SET last_seen=? WHERE id=?", (now, row["id"]))
-        con.execute(
-            "INSERT INTO devices (device_id, key_code, first_seen, last_seen) VALUES (?,?,?,?)",
-            (device, code, now, now))
-    con.commit()
-    con.close()
-
     expires = row["expires_at"]
     permanent = expires >= 0xFFFFFFFF
     if not permanent and expires < now:
+        con.close()
         return jdump({"ok": False, "reason": "expired"}, 200)
+
+    kcode = row["key_code"]
+    limit = int(row["device_limit"] or 0)
+    used = 0
+    if device:
+        known = con.execute(
+            "SELECT 1 FROM devices WHERE key_code=? AND device_id=?",
+            (kcode, device)).fetchone() is not None
+        used = con.execute(
+            "SELECT COUNT(DISTINCT device_id) FROM devices WHERE key_code=?",
+            (kcode,)).fetchone()[0]
+        if not known:
+            # device limit: 0 = unlimited, otherwise the key dies past N phones
+            if limit and used >= limit:
+                con.close()
+                return jdump({"ok": False, "reason": "max device reached",
+                              "limit": limit, "used": used}, 200)
+            con.execute(
+                "INSERT INTO devices (device_id, key_code, first_seen, last_seen) VALUES (?,?,?,?)",
+                (device, kcode, now, now))
+            used += 1
+        else:
+            con.execute("UPDATE devices SET last_seen=? WHERE key_code=? AND device_id=?",
+                        (now, kcode, device))
+        if not row["device"]:
+            con.execute("UPDATE keys SET device=? WHERE id=?", (device, row["id"]))
+        con.execute("UPDATE keys SET last_seen=? WHERE id=?", (now, row["id"]))
+    con.commit()
+    con.close()
+
     return jdump({"ok": True, "expires": expires, "permanent": permanent,
                   "days": row["days"], "plan": lc.dur_tag(row["days"]),
-                  "receipt": lc.make_receipt(code, expires),
-                  "key": code})
+                  "custom": bool(row["custom"]),
+                  "device_limit": limit, "devices_used": used,
+                  "receipt": lc.make_receipt(kcode, expires),
+                  "key": kcode})
 
 
 def normalize_key(raw):
@@ -802,6 +879,67 @@ def normalize_key(raw):
 def api_apk_ping(handler, qs):
     return jdump({"ok": True, "server_time": int(time.time())})
 
+
+
+
+
+
+def api_key_detail(handler, kid):
+    """full key info + every device that ever bound to it"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    con = db()
+    row = con.execute(
+        "SELECT k.*, u.username AS by FROM keys k JOIN users u ON u.id=k.created_by"
+        " WHERE k.id=?", (kid,)).fetchone()
+    if row is None:
+        con.close()
+        return jdump({"error": "not found"}, 404)
+    if u["role"] == "reseller" and row["created_by"] != u["id"]:
+        con.close()
+        return jdump({"error": "not allowed"}, 403)
+    d = dict(row)
+    d["display"] = d["key_code"] if d.get("custom") else d["key_code"] + "-" + lc.dur_tag(d["days"])
+    devs = [dict(r) for r in con.execute(
+        "SELECT * FROM devices WHERE key_code=? ORDER BY last_seen DESC",
+        (d["key_code"],))]
+    con.close()
+    return jdump({"key": d, "devices": devs})
+
+
+def api_key_device_unbind(handler, kid, body):
+    """drop ONE bound phone (customer sold it / changed it), others stay"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] == "reseller":
+        return jdump({"error": "resellers cannot unbind devices"}, 403)
+    dev = (body.get("device_id") or "")[:64]
+    if not dev:
+        return jdump({"error": "no device_id"}, 400)
+    con = db()
+    row = con.execute("SELECT * FROM keys WHERE id=?", (kid,)).fetchone()
+    if row is None:
+        con.close()
+        return jdump({"error": "not found"}, 404)
+    con.execute("DELETE FROM devices WHERE key_code=? AND device_id=?",
+                (row["key_code"], dev))
+    # if that was the display device, hand the slot to the next phone in line
+    if row["device"] == dev:
+        nxt = con.execute(
+            "SELECT device_id FROM devices WHERE key_code=? ORDER BY last_seen DESC LIMIT 1",
+            (row["key_code"],)).fetchone()
+        con.execute("UPDATE keys SET device=? WHERE id=?",
+                    (nxt["device_id"] if nxt else "", kid))
+    con.commit()
+    devs = [dict(r) for r in con.execute(
+        "SELECT * FROM devices WHERE key_code=? ORDER BY last_seen DESC",
+        (row["key_code"],))]
+    con.close()
+    return jdump({"ok": True, "devices": devs})
+
+
 def api_verify_key(handler, qs):
     """dashboard-side check (mirrors the apk flow)"""
     code = qs.get("key", [""])[0]
@@ -809,16 +947,19 @@ def api_verify_key(handler, qs):
         return jdump({"error": "no key"}, 400)
     kcode, days = lc.parse(code)
     out = {"ok": False, "reason": "invalid key"}
-    if kcode is None:
-        out = lc.verify_legacy(code)
-        out["legacy"] = True
     con = db()
+    row = None
     if kcode:
         row = con.execute(
             "SELECT k.*, u.username AS by FROM keys k JOIN users u ON u.id=k.created_by"
             " WHERE k.key_code=?", (kcode,)).fetchone()
-    else:
-        row = None
+    if row is None:
+        # custom key: exact text lookup, any length / case
+        ckey = lc.normalize_custom(code)
+        if ckey and ckey != kcode:
+            row = con.execute(
+                "SELECT k.*, u.username AS by FROM keys k JOIN users u ON u.id=k.created_by"
+                " WHERE k.key_code=?", (ckey,)).fetchone()
     if row:
         now = int(time.time())
         out["in_db"] = True
@@ -827,7 +968,12 @@ def api_verify_key(handler, qs):
         out["by"] = row["by"]
         out["by_role"] = row["created_by_role"]
         out["plan"] = lc.dur_tag(row["days"])
+        out["custom"] = bool(row["custom"])
         out["device"] = row["device"]
+        out["device_limit"] = int(row["device_limit"] or 0)
+        out["devices_used"] = con.execute(
+            "SELECT COUNT(DISTINCT device_id) FROM devices WHERE key_code=?",
+            (row["key_code"],)).fetchone()[0]
         out["last_seen"] = row["last_seen"]
         if row["status"] != "active":
             out.update({"ok": False, "reason": "revoked"})
@@ -838,6 +984,12 @@ def api_verify_key(handler, qs):
                         "permanent": row["expires_at"] >= 0xFFFFFFFF})
             out.pop("reason", None)
     else:
+        if kcode is None:
+            leg = lc.verify_legacy(code)
+            if leg.get("ok") or lc.verify_legacy_v1(code):
+                out = dict(leg) if leg.get("ok") else {"ok": True, "expires": 0xFFFFFFFF,
+                                                       "permanent": True}
+                out["legacy"] = True
         out["in_db"] = False
     con.close()
     return jdump(out)
@@ -876,7 +1028,7 @@ CONTENT_TYPES = {
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "YADAV-DASH/2.0"
+    server_version = f"YADAV-DASH/{VERSION}"
 
     def log_message(self, fmt, *args):
         pass
@@ -912,6 +1064,14 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and path.startswith("/api/keys/") and path.endswith("/revoke"):
             kid = path.split("/")[3]
             status, hdr, resp = api_keys_revoke(self, kid, body)
+            return self._send(status, hdr, resp)
+        if method == "GET" and path.startswith("/api/keys/") and path.endswith("/detail"):
+            kid = path.split("/")[3]
+            status, hdr, resp = api_key_detail(self, kid)
+            return self._send(status, hdr, resp)
+        if method == "POST" and path.startswith("/api/keys/") and path.endswith("/device"):
+            kid = path.split("/")[3]
+            status, hdr, resp = api_key_device_unbind(self, kid, body)
             return self._send(status, hdr, resp)
         if method == "POST" and path.startswith("/api/keys/") and path.endswith("/reset"):
             kid = path.split("/")[3]
@@ -958,9 +1118,11 @@ def main():
     srv = ThreadingHTTPServer((host, port), Handler)
     public = os.environ.get("PUBLIC_URL", "")
     print("=" * 58)
-    print("  YADAV CHEATS DASHBOARD v2")
+    print(f"  YADAV CHEATS DASHBOARD v{VERSION}")
     print(f"  http://localhost:{port}")
     print("  owner login: owner / (OWNER_PASSWORD env)")
+    print("  keys: YADAV-••••••••-DUR  ya  CUSTOM (any text, 1-40 chars)")
+    print("  device limit per key: 1/2/3/5/10/unlimited")
     if public:
         print(f"  apk endpoint: {public}/api/apk/verify")
     else:
