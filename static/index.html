@@ -10,12 +10,32 @@
 
 <canvas id="fx"></canvas>
 
+<!-- ═══════════ SPLASH ═══════════ -->
+<div id="splash">
+  <div class="splash-in">
+    <div class="logo-mark">Y</div>
+    <div class="grad-text">YADAV CHEATS</div>
+    <div class="sub">ULTRA PREMIUM CONTROL CENTER • V2.2</div>
+    <div class="splash-bar"><i></i></div>
+  </div>
+</div>
+
+<!-- ═══════════ COMMAND PALETTE ═══════════ -->
+<div id="palette" class="palette hidden">
+  <div class="pal-back" data-close-pal="1"></div>
+  <div class="pal-box glass pop-in">
+    <input id="palInput" placeholder="type a page, action, or key…" autocomplete="off" spellcheck="false">
+    <div id="palList"></div>
+    <div class="pal-foot"><span>↑↓ navigate</span><span>ENTER select</span><span>ESC close</span></div>
+  </div>
+</div>
+
 <!-- ═══════════ LOGIN ═══════════ -->
 <div id="loginView" class="view">
   <div class="login-card glass pop-in">
     <div class="logo-mark">Y</div>
     <h1 class="grad-text">YADAV CHEATS</h1>
-    <p class="sub">SECURE LICENSE CONTROL CENTER &nbsp;•&nbsp; V2.1</p>
+    <p class="sub">SECURE LICENSE CONTROL CENTER &nbsp;•&nbsp; V2.2 ULTRA</p>
     <form id="loginForm" autocomplete="off">
       <label>USERNAME</label>
       <input id="lgUser" type="text" placeholder="owner" required>
@@ -51,6 +71,8 @@
         <i>♦</i><span>Resellers</span></a>
       <a href="#/ledger" data-page="ledger" class="nav-item">
         <i>▤</i><span>Balance Ledger</span></a>
+      <a href="#/feed" data-page="feed" class="nav-item">
+        <i>⚡</i><span>Live Feed</span></a>
       <a href="#/settings" data-page="settings" class="nav-item">
         <i>⚙</i><span>Settings</span></a>
     </nav>
@@ -68,7 +90,8 @@
         <div class="sub" id="pageSub">live control panel</div>
       </div>
       <div class="top-right">
-        <div class="live-pill"><span class="pulse-dot"></span> LIVE <span id="clock">--:--:--</span></div>
+        <button class="cmd-chip" id="btnPalette" title="command palette">⌘ CTRL+K</button>
+        <div class="live-pill"><span class="pulse-dot"></span> LIVE <span id="pingMs">—</span>ms <span id="clock">--:--:--</span></div>
         <div class="user-chip glass">
           <div class="avatar" id="uAvatar">Y</div>
           <div>

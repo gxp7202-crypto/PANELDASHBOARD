@@ -115,6 +115,13 @@ def init_db():
         created_by INTEGER,
         created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        by_user INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    );
     """)
     # migrate: creator-role column for old dbs
     cols = [r[1] for r in con.execute("PRAGMA table_info(keys)")]
@@ -138,6 +145,7 @@ def init_db():
         con.execute("ALTER TABLE keys ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 1")
     con.execute("CREATE INDEX IF NOT EXISTS ix_devices_key ON devices(key_code)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_keys_created ON keys(created_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_events_time ON events(created_at)")
 
     row = con.execute("SELECT * FROM users WHERE role='owner'").fetchone()
     if row is None:
@@ -225,6 +233,23 @@ def clamp_device_limit(v, default=1):
     return 0 if n <= 0 else max(1, min(50, n))
 
 
+def log_event(con, kind, text, by_user=0):
+    """audit wire — every important action lands on the live feed"""
+    try:
+        con.execute("INSERT INTO events (kind, text, by_user, created_at) VALUES (?,?,?,?)",
+                    (kind, str(text)[:160], int(by_user or 0), int(time.time())))
+    except Exception:
+        pass
+
+
+def label_of(role):
+    return {"admin": "admin", "reseller": "reseller", "owner": "owner"}.get(role, role)
+
+
+def fmt_bal(b):
+    return (round(float(b or 0) * 100) / 100)
+
+
 # ───────────────────────── auth api ─────────────────────────
 
 def api_login(handler, body):
@@ -241,6 +266,7 @@ def api_login(handler, body):
     tok = secrets.token_hex(32)
     con.execute("INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?)",
                 (tok, u["id"], int(time.time())))
+    log_event(con, "login", f"{un} ({u['role']}) logged in", u["id"])
     con.commit()
     con.close()
     return (200,
@@ -506,6 +532,11 @@ def api_keys_create(handler, body):
         con.close()
         return jdump({"error": "key already exists"}, 400)
 
+    log_event(con, "key.create",
+              f"{u['username']} created {len(made)}x {lc.dur_tag(days)}"
+              + (f' custom "{made[0]}"' if custom else "")
+              + f" • device limit {devlim or '∞'}", u["id"])
+
     if total_cost:
         after = row["balance"] - total_cost
         con.execute("UPDATE users SET balance=? WHERE id=?", (after, u["id"]))
@@ -566,6 +597,9 @@ def api_keys_revoke(handler, kid, body):
         con.close()
         return jdump({"error": "not found"}, 404)
     con.execute("UPDATE keys SET status='revoked' WHERE id=?", (kid,))
+    log_event(con, "key.revoke",
+              f"{u['username']} revoked {row['key_code']}"
+              + (" (custom)" if row["custom"] else "-" + lc.dur_tag(row["days"])), u["id"])
     con.commit()
     con.close()
     return jdump({"ok": True})
@@ -614,11 +648,14 @@ def api_keys_reset(handler, kid, body):
     if body.get("note") is not None:
         con.execute("UPDATE keys SET note=? WHERE id=?", ((body.get("note") or "")[:80], kid))
         actions.append("note saved")
+    if not actions:
+        con.close()
+        return jdump({"error": "nothing to do - pick an action"}, 400)
+    log_event(con, "key.reset",
+              f"{u['username']} reset {row['key_code']}: " + ", ".join(actions), u["id"])
     con.commit()
     fresh = con.execute("SELECT * FROM keys WHERE id=?", (kid,)).fetchone()
     con.close()
-    if not actions:
-        return jdump({"error": "nothing to do - pick an action"}, 400)
     return jdump({"ok": True, "actions": actions, "key": dict(fresh)})
 
 
@@ -686,6 +723,8 @@ def api_users_create(handler, body):
         con.execute("INSERT INTO ledger (user_id, delta, balance_after, reason, by_user, created_at)"
                     " VALUES (?,?,?,?,?,?)",
                     (uid, balance, balance, "opening balance", u["id"], now))
+    log_event(con, "user.create", f"{u['username']} created {label_of(role)} \"{un}\""
+              + (f" with {balance} credits" if balance > 0 else ""), u["id"])
     con.commit()
     con.close()
     return jdump({"ok": True, "id": uid})
@@ -711,6 +750,8 @@ def api_users_delete(handler, uid, body):
         con.execute("UPDATE keys SET status='revoked' WHERE created_by=? AND status='active'", (uid,))
     con.execute("DELETE FROM ledger WHERE user_id=?", (uid,))
     con.execute("DELETE FROM users WHERE id=?", (uid,))
+    log_event(con, "user.delete", f"{u['username']} DELETED {t['username']} ({t['role']})"
+              + (" — keys revoked" if not keep_keys else " — keys kept"), u["id"])
     con.commit()
     con.close()
     return jdump({"ok": True, "revoked_keys": not keep_keys})
@@ -730,6 +771,8 @@ def api_users_ban(handler, uid, body):
         con.close()
         return jdump({"error": "not allowed"}, 403)
     con.execute("UPDATE users SET banned=? WHERE id=?", (banned, uid))
+    log_event(con, "user.ban", f"{u['username']} {'BANNED' if banned else 'unbanned'} "
+              f"{t['username']} ({t['role']})", u["id"])
     if banned:
         con.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
     con.commit()
@@ -761,6 +804,8 @@ def api_users_balance(handler, uid, body):
     con.execute("INSERT INTO ledger (user_id, delta, balance_after, reason, by_user, created_at)"
                 " VALUES (?,?,?,?,?,?)",
                 (uid, new_bal - t["balance"], new_bal, note, u["id"], int(time.time())))
+    log_event(con, "balance", f"{u['username']} {amount:+g} credits → {t['username']} "
+              f"({fmt_bal(t['balance'])} → {fmt_bal(new_bal)})", u["id"])
     con.commit()
     con.close()
     return jdump({"ok": True, "balance": new_bal})
@@ -847,12 +892,16 @@ def api_apk_verify(handler, qs):
         if not known:
             # device limit: 0 = unlimited, otherwise the key dies past N phones
             if limit and used >= limit:
+                log_event(con, "device.block",
+                          f"phone {device[:14]}… rejected — max device reached on {kcode}")
                 con.close()
                 return jdump({"ok": False, "reason": "max device reached",
                               "limit": limit, "used": used}, 200)
             con.execute(
                 "INSERT INTO devices (device_id, key_code, first_seen, last_seen) VALUES (?,?,?,?)",
                 (device, kcode, now, now))
+            log_event(con, "device.bind",
+                      f"phone {device[:14]}… bound to {kcode} ({used + 1}/{limit or '∞'})")
             used += 1
         else:
             con.execute("UPDATE devices SET last_seen=? WHERE key_code=? AND device_id=?",
@@ -925,6 +974,8 @@ def api_key_device_unbind(handler, kid, body):
         return jdump({"error": "not found"}, 404)
     con.execute("DELETE FROM devices WHERE key_code=? AND device_id=?",
                 (row["key_code"], dev))
+    log_event(con, "device.unbind",
+              f"{u['username']} unbound phone {dev[:14]}… from {row['key_code']}", u["id"])
     # if that was the display device, hand the slot to the next phone in line
     if row["device"] == dev:
         nxt = con.execute(
@@ -995,6 +1046,78 @@ def api_verify_key(handler, qs):
     return jdump(out)
 
 
+# ───────────────────────── premium: live feed + advanced stats ─────────────────────────
+
+def api_events(handler, qs):
+    """live audit wire — every action, role-scoped"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    try:
+        limit = max(10, min(200, int(qs.get("limit", ["60"])[0])))
+    except Exception:
+        limit = 60
+    kind = (qs.get("kind", ["all"])[0] or "all")
+    con = db()
+    where, params = [], []
+    if u["role"] == "reseller":
+        where.append("by_user=?")
+        params.append(u["id"])
+    if kind != "all":
+        where.append("kind=?")
+        params.append(kind)
+    rows = con.execute(
+        "SELECT e.*, us.username AS who FROM events e"
+        " LEFT JOIN users us ON us.id=e.by_user"
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + " ORDER BY e.id DESC LIMIT ?", params + [limit]).fetchall()
+    con.close()
+    return jdump({"events": [dict(r) for r in rows], "role": u["role"]})
+
+
+def api_stats_advanced(handler, body):
+    """donut split, expiring-soon list, top sellers, live device metrics"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    now = int(time.time())
+    con = db()
+    mine = " AND created_by=?" if u["role"] == "reseller" else ""
+    mp = (u["id"],) if u["role"] == "reseller" else ()
+
+    split = {r[0]: r[1] for r in con.execute(
+        "SELECT created_by_role, COUNT(*) AS n FROM keys WHERE status='active'" + mine
+        + " GROUP BY created_by_role", mp)}
+
+    expiring = [dict(r) for r in con.execute(
+        "SELECT k.id, k.key_code, k.days, k.expires_at, k.custom, k.device_limit, k.note,"
+        " u.username AS by FROM keys k JOIN users u ON u.id=k.created_by"
+        " WHERE k.status='active' AND k.days!=-1 AND k.expires_at BETWEEN ? AND ?" + mine
+        + " ORDER BY k.expires_at ASC LIMIT 12", (now, now + 3 * 86400) + mp)]
+
+    top = []
+    if u["role"] != "reseller":
+        top = [{"username": r[0], "keys": r[1]} for r in con.execute(
+            "SELECT u.username, COUNT(*) AS n FROM keys k JOIN users u ON u.id=k.created_by"
+            " WHERE k.created_by_role='reseller' AND k.status='active'"
+            " GROUP BY k.created_by ORDER BY n DESC LIMIT 6")]
+
+    live = {
+        "devices_24h": con.execute(
+            "SELECT COUNT(*) FROM devices WHERE last_seen > ?", (now - 86400,)).fetchone()[0],
+        "phones_now": con.execute(
+            "SELECT COUNT(*) FROM keys WHERE status='active' AND last_seen > ?",
+            (now - 3600,)).fetchone()[0],
+        "keys_expiring_3d": len(expiring),
+        "blocked_devices_24h": con.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='device.block' AND created_at > ?",
+            (now - 86400,)).fetchone()[0],
+    }
+    con.close()
+    return jdump({"split": split, "expiring": expiring, "top": top, "live": live,
+                  "server_time": now})
+
+
 # ───────────────────────── routing ─────────────────────────
 
 ROUTES = {
@@ -1011,6 +1134,8 @@ ROUTES = {
     ("GET", "/api/users"):     lambda h, b, q: api_users_list(h, q),
     ("POST", "/api/users"):    lambda h, b, q: api_users_create(h, b),
     ("GET", "/api/verify"):    lambda h, b, q: api_verify_key(h, q),
+    ("GET", "/api/events"):    lambda h, b, q: api_events(h, q),
+    ("GET", "/api/stats/advanced"): lambda h, b, q: api_stats_advanced(h, b),
     # public APK endpoints (no session)
     ("GET", "/api/apk/verify"): lambda h, b, q: api_apk_verify(h, q),
     ("GET", "/api/apk/ping"):   lambda h, b, q: api_apk_ping(h, q),

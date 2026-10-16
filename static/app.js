@@ -8,6 +8,8 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
 
 let ME = null;          // {user, presets, costs, my_active_keys}
 let POLL = null;
+let EV_POLL = null;
+let ADV_POLL = null;
 
 /* ───────── api ───────── */
 async function api(path, method = "GET", body) {
@@ -173,9 +175,12 @@ async function showApp() {
 }
 async function boot() {
   const r = await api("/api/me");
+  const splash = $("#splash");
+  if (splash) setTimeout(() => splash.classList.add("gone"), 900);
   if (r.error) return showLogin();
   ME = r;
   showApp();
+  initPalette();
 }
 $("#loginForm").addEventListener("submit", async e => {
   e.preventDefault();
@@ -194,6 +199,7 @@ $("#loginForm").addEventListener("submit", async e => {
   }
   $("#lgErr").textContent = "";
   toast("welcome back, " + r.user.username, "gold");
+  confetti(innerWidth / 2, innerHeight / 2.6, 34);
   boot();
 });
 $("#btnLogout").addEventListener("click", async () => {
@@ -208,6 +214,7 @@ const TITLES = {
   admins: ["Admins", "owner only — create, ban, delete"],
   resellers: ["Resellers", "create • ban • top-up • delete"],
   ledger: ["Balance Ledger", "every credit movement"],
+  feed: ["Live Feed", "every action, the moment it happens"],
   settings: ["Settings", "account security"]
 };
 addEventListener("hashchange", () => go(location.hash));
@@ -225,7 +232,11 @@ function go(hash) {
   stopPoll();
   PAGES[page]();
 }
-function stopPoll() { if (POLL) { clearInterval(POLL); POLL = null; } }
+function stopPoll() {
+  if (POLL) { clearInterval(POLL); POLL = null; }
+  if (EV_POLL) { clearInterval(EV_POLL); EV_POLL = null; }
+  if (ADV_POLL) { clearInterval(ADV_POLL); ADV_POLL = null; }
+}
 
 /* ═══════════ pages ═══════════ */
 const PAGES = {};
@@ -340,9 +351,29 @@ PAGES.overview = async () => {
         <b style="color:var(--red)">"max device reached"</b> dikhta hai — reset se unbind karke
         naya phone allow kar sakte ho.</div>
       </div>
+    </div>
+    <div class="cols" style="margin-top:15px" id="premRow">
+      <div class="card">
+        <h3>ACTIVE KEY ORIGIN — LIVE SPLIT</h3>
+        <div class="donut-wrap">
+          <div class="donut" id="donut"><div class="donut-hole"><b id="donutTotal">0</b><span>ACTIVE</span></div></div>
+          <div class="donut-legend" id="donutLegend"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>⚠ EXPIRING IN 3 DAYS</h3>
+        <div id="expSoon"><div class="empty" style="padding:24px"><span class="spinner"></span></div></div>
+      </div>
+      <div class="card">
+        <h3>⚡ EVENT WIRE <span class="wire-live"><span class="pulse-dot"></span> LIVE</span></h3>
+        <div class="wire-stats" id="wireStats"></div>
+        <div id="wireBox"><div class="empty" style="padding:24px"><span class="spinner"></span></div></div>
+      </div>
     </div>`;
   $$(".stat-card .v", el).forEach(v => countUp(v, parseFloat(v.dataset.to) || 0));
   bindCopy(el);
+  loadPremium();
+  ADV_POLL = setInterval(loadPremium, 12000);
 
   POLL = setInterval(async () => {
     const rr = await api("/api/overview");
@@ -361,6 +392,263 @@ PAGES.overview = async () => {
     });
   }, 8000);
 };
+
+/* ───── premium panels: donut / expiring / event wire ───── */
+const ORIGIN_COLORS = { owner: "var(--gold)", admin: "var(--blue)", reseller: "var(--green)" };
+const ORIGIN_LABELS = { owner: "OWNER KEYS", admin: "ADMIN KEYS", reseller: "RESELLER KEYS" };
+
+async function loadPremium() {
+  if (!$("#donut")) return;
+  const r = await api("/api/stats/advanced");
+  if (r.error) return;
+  // donut
+  const parts = Object.entries(r.split || {}).filter(([, n]) => n > 0);
+  const total = parts.reduce((a, b) => a + b[1], 0) || 1;
+  let acc = 0;
+  const segs = parts.map(([k, n]) => {
+    const from = acc / total * 360; acc += n;
+    return `${ORIGIN_COLORS[k] || "var(--sub)"} ${from}deg ${acc / total * 360}deg`;
+  });
+  $("#donut").style.background = segs.length
+    ? `conic-gradient(${segs.join(",")})` : "#2A2A3D";
+  countUp($("#donutTotal"), total);
+  $("#donutLegend").innerHTML = parts.length ? parts.map(([k, n]) => `
+    <div class="lg-row"><span class="lg-dot" style="background:${ORIGIN_COLORS[k] || "var(--sub)"}"></span>
+    ${ORIGIN_LABELS[k] || k.toUpperCase()}<b>${n}</b></div>`).join("")
+    : `<div class="note" style="margin:0">no active keys yet</div>`;
+  // expiring soon
+  const exp = r.expiring || [];
+  const canQuick = ME.user.role !== "reseller";
+  $("#expSoon").innerHTML = exp.length ? exp.map(k => {
+    const hrs = Math.max(0, Math.round((k.expires_at - r.server_time) / 3600));
+    const name = k.custom ? k.key_code : k.key_code + "-" + durTag(k.days);
+    return `<div class="wire-row">
+      <div class="wire-main"><span class="kc" style="font-size:11px">${esc(name)}</span>
+        <div class="sub" style="letter-spacing:.05em;margin-top:3px">${esc(k.by)} • ${hrs}h left</div></div>
+      ${canQuick ? `<button class="btn btn-sm btn-green" data-extend="${k.id}">+7D</button>` : ""}
+    </div>`;
+  }).join("") : `<div class="empty" style="padding:24px"><div class="big">🛡</div>nothing expiring soon</div>`;
+  $$("[data-extend]", $("#expSoon")).forEach(b => b.onclick = async () => {
+    const rr = await api(`/api/keys/${b.dataset.extend}/reset`, "POST", { add_days: 7 });
+    if (rr.error) return toast(rr.error, "err");
+    toast("+7 days added", "gold");
+    loadPremium();
+  });
+  // event wire
+  renderWire(r.live || {});
+  loadWire();
+  if (!EV_POLL) EV_POLL = setInterval(loadWire, 7000);
+}
+
+function renderWire(live) {
+  let el = $("#wireStats");
+  if (!el) return;
+  el.innerHTML = `
+    <span title="phones seen in last 24h">📱 ${live.devices_24h ?? 0} devices/24h</span>
+    <span title="keys used in last hour">🔥 ${live.phones_now ?? 0} active now</span>
+    <span title="devices blocked by limit in last 24h">⛔ ${live.blocked_devices_24h ?? 0} blocked/24h</span>`;
+}
+
+const EV_ICONS = { login: "🔑", "key.create": "✨", "key.revoke": "⛔", "key.reset": "🛠",
+  "device.bind": "📱", "device.block": "⛔", "device.unbind": "🔌",
+  "user.create": "👤", "user.delete": "🗑", "user.ban": "🚫", balance: "💰" };
+
+async function loadWire() {
+  const box = $("#wireBox");
+  if (!box) return;
+  const r = await api("/api/events?limit=10");
+  if (r.error) return;
+  const ev = r.events || [];
+  box.innerHTML = ev.length ? ev.map(e => `
+    <div class="wire-row">
+      <span class="ev-ico">${EV_ICONS[e.kind] || "•"}</span>
+      <div class="wire-main">${esc(e.text)}
+        <div class="sub" style="letter-spacing:.05em;margin-top:2px">${relTime(e.created_at)}</div></div>
+    </div>`).join("") : `<div class="empty" style="padding:20px">no events yet</div>`;
+}
+
+/* ───── live feed ───── */
+let FEED_KIND = "all";
+const FEED_KINDS = [["all", "ALL"], ["key", "KEYS"], ["device", "DEVICES"],
+                    ["user", "USERS"], ["login", "LOGINS"], ["balance", "BALANCE"]];
+
+PAGES.feed = async () => {
+  const el = $("#page");
+  el.innerHTML = `
+    <div class="role-note glass">⚡ har action — key create, revoke, phone bind, login, balance —
+    yahan <b style="color:var(--gold)">real-time</b> girta hai. page khula rahega to wire live chalti rahegi.</div>
+    <div class="card">
+      <div class="origin-tabs" id="feedTabs">
+        ${FEED_KINDS.map(([v, t]) => `
+          <button class="otab ${v === FEED_KIND ? "sel" : ""}" data-k="${v}">${t}</button>`).join("")}
+        <div class="spacer" style="flex:1"></div>
+        <span class="wire-live"><span class="pulse-dot"></span> STREAMING</span>
+      </div>
+      <div id="feedList"><div class="empty"><span class="spinner"></span></div></div>
+    </div>`;
+  $$("#feedTabs .otab").forEach(b => b.onclick = () => {
+    FEED_KIND = b.dataset.k;
+    $$("#feedTabs .otab").forEach(x => x.classList.remove("sel"));
+    b.classList.add("sel");
+    loadFeed();
+  });
+  await loadFeed();
+  EV_POLL = setInterval(loadFeed, 5000);
+};
+
+async function loadFeed() {
+  const box = $("#feedList");
+  if (!box) return;
+  const r = await api(`/api/events?limit=120&kind=${FEED_KIND}`);
+  if (r.error) return;
+  const ev = r.events || [];
+  box.innerHTML = ev.length ? `
+    <table class="tbl"><thead><tr>
+      <th style="width:44px"></th><th>EVENT</th><th>TYPE</th><th>WHEN</th></tr></thead>
+    <tbody>${ev.map((e, i) => `
+      <tr style="animation-delay:${Math.min(i, 14) * 30}ms">
+        <td style="font-size:17px">${EV_ICONS[e.kind] || "•"}</td>
+        <td>${esc(e.text)}</td>
+        <td><span class="badge badge-gray">${esc(e.kind)}</span></td>
+        <td class="mono" style="white-space:nowrap">${relTime(e.created_at)}</td>
+      </tr>`).join("")}</tbody></table>`
+    : `<div class="empty"><div class="big">⚡</div>no events yet</div>`;
+}
+
+/* ───── command palette ───── */
+function initPalette() {
+  const pal = $("#palette"), input = $("#palInput"), list = $("#palList");
+  let items = [], sel = 0, searchTimer = null;
+
+  const BASE = () => [
+    { icon: "◆", label: "Go to Overview", hint: "page", run: () => go("#/overview") },
+    { icon: "❖", label: "Go to License Keys", hint: "page", run: () => go("#/keys") },
+    { icon: "⚡", label: "Go to Live Feed", hint: "page", run: () => go("#/feed") },
+    { icon: "▤", label: "Go to Balance Ledger", hint: "page", run: () => go("#/ledger") },
+    { icon: "⚙", label: "Go to Settings", hint: "page", run: () => go("#/settings") },
+    { icon: "★", label: "Go to Admins", hint: "owner", run: () => go("#/admins") },
+    { icon: "♦", label: "Go to Resellers", hint: "page", run: () => go("#/resellers") },
+    { icon: "+", label: "Create license keys", hint: "action", run: () => { go("#/keys"); setTimeout(openCreateKey, 350); } },
+    { icon: "📄", label: "Export keys as CSV", hint: "action", run: () => exportCSV(LAST_ROWS) },
+  ].filter(x => x.hint !== "owner" || ME.user.role === "owner");
+
+  function render(q) {
+    let its = BASE();
+    const needle = q.trim().toLowerCase();
+    if (needle) its = its.filter(x => x.label.toLowerCase().includes(needle));
+    items = its; sel = 0;
+    list.innerHTML = its.length ? its.map((x, i) => `
+      <div class="pal-item ${i === 0 ? "sel" : ""}" data-i="${i}">
+        <span class="pal-ico">${x.icon}</span><span>${esc(x.label)}</span>
+        <span class="pal-hint">${x.hint}</span></div>`).join("")
+      : `<div class="pal-empty">kuch nahi mila</div>`;
+    $$(".pal-item", list).forEach(d => d.onclick = () => pick(parseInt(d.dataset.i)));
+    // live key search
+    if (needle.length >= 2) {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(async () => {
+        const r = await api(`/api/keys?status=all&q=${encodeURIComponent(needle)}`);
+        if (r.error || !r.keys || !r.keys.length || pal.classList.contains("hidden")) return;
+        const kitems = r.keys.slice(0, 6).map(k => ({
+          icon: "🔑", label: k.display || k.key_code,
+          hint: `${k.status} • ${k.by}`,
+          run: () => copyText(k.display || k.key_code)
+        }));
+        items = items.concat(kitems);
+        list.innerHTML += kitems.map((x, i) => `
+          <div class="pal-item" data-i="${items.length - kitems.length + i}">
+            <span class="pal-ico">${x.icon}</span><span class="mono">${esc(x.label)}</span>
+            <span class="pal-hint">${esc(x.hint)}</span></div>`).join("");
+        $$(".pal-item", list).forEach(d => d.onclick = () => pick(parseInt(d.dataset.i)));
+      }, 260);
+    }
+  }
+  function pick(i) {
+    const x = items[i];
+    if (!x) return;
+    closePal();
+    x.run();
+  }
+  function move(d) {
+    if (!items.length) return;
+    sel = (sel + d + items.length) % items.length;
+    $$(".pal-item", list).forEach((el, i) => el.classList.toggle("sel", i === sel));
+    const cur = $$(".pal-item", list)[sel];
+    if (cur) cur.scrollIntoView({ block: "nearest" });
+  }
+  function openPal() {
+    pal.classList.remove("hidden");
+    input.value = ""; render("");
+    input.focus();
+  }
+  function closePal() { pal.classList.add("hidden"); }
+
+  $("#btnPalette").onclick = openPal;
+  $("[data-close-pal]").onclick = closePal;
+  input.oninput = () => render(input.value);
+  input.onkeydown = e => {
+    if (e.key === "Escape") closePal();
+    else if (e.key === "ArrowDown") { e.preventDefault(); move(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); move(-1); }
+    else if (e.key === "Enter") { e.preventDefault(); pick(sel); }
+  };
+  addEventListener("keydown", e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      pal.classList.contains("hidden") ? openPal() : closePal();
+    }
+  });
+}
+
+/* ───── accent themes ───── */
+const ACCENTS = {
+  gold: ["#FFD026", "#FFE45C", "#E0A800"],
+  crimson: ["#FF4D6D", "#FF7A93", "#C9184A"],
+  emerald: ["#2EE66B", "#66F09B", "#12A150"],
+  violet: ["#A66BFF", "#C29BFF", "#7B2FF7"],
+  cyan: ["#22D3EE", "#67E8F9", "#0E9BB5"]
+};
+function applyAccent(name) {
+  const a = ACCENTS[name] || ACCENTS.gold;
+  document.body.dataset.accent = name;
+  document.documentElement.style.setProperty("--gold", a[0]);
+  document.documentElement.style.setProperty("--gold2", a[1]);
+  document.documentElement.style.setProperty("--gold3", a[2]);
+  try { localStorage.setItem("yadav_accent", name); } catch { }
+}
+(function bootAccent() {
+  let a = "gold";
+  try { a = localStorage.getItem("yadav_accent") || "gold"; } catch { }
+  applyAccent(a);
+})();
+
+/* ───── confetti ───── */
+function confetti(x = innerWidth / 2, y = innerHeight / 3, n = 26) {
+  const cols = ["var(--gold)", "var(--green)", "var(--blue)", "#fff"];
+  for (let i = 0; i < n; i++) {
+    const s = document.createElement("span");
+    s.className = "conf";
+    s.style.left = x + "px"; s.style.top = y + "px";
+    s.style.background = cols[i % cols.length];
+    const ang = Math.random() * Math.PI * 2, dist = 60 + Math.random() * 160;
+    s.style.setProperty("--tx", Math.cos(ang) * dist + "px");
+    s.style.setProperty("--ty", Math.sin(ang) * dist + 120 + "px");
+    s.style.setProperty("--rot", Math.random() * 720 - 360 + "deg");
+    s.style.animationDelay = Math.random() * 120 + "ms";
+    document.body.appendChild(s);
+    setTimeout(() => s.remove(), 1200);
+  }
+}
+
+/* ───── server latency ───── */
+setInterval(async () => {
+  const el = $("#pingMs");
+  if (!el) return;
+  const t0 = performance.now();
+  const r = await api("/api/apk/ping");
+  if (r.error) { el.textContent = "✕"; return; }
+  el.textContent = Math.round(performance.now() - t0);
+}, 9000);
 
 /* ───── keys ───── */
 let KEY_ORIGIN = "all";
@@ -864,6 +1152,7 @@ async function openCreateKey() {
       if (r.error) return toast(r.error, "err");
       if (r.cost && role === "reseller") { ME.user.balance -= r.cost; $("#uBal").textContent = fmtBal(ME.user.balance); }
       copyText(r.keys.join("\n"));          // CREATE & COPY → straight to clipboard
+      confetti(innerWidth / 2, innerHeight / 2.4);
       showKeyResult(r.keys, sel, r.product);
       toast(r.keys.length + " key(s) created + copied", "gold");
       if ($("#kList")) loadKeys();
@@ -1106,6 +1395,18 @@ PAGES.settings = () => {
         <button class="btn btn-gold-sm" id="pwGo" style="margin-top:18px">UPDATE PASSWORD</button>
       </div>
       <div class="card">
+        <h3>APPEARANCE</h3>
+        <div class="sub" style="letter-spacing:.18em;font-size:10px;margin-bottom:12px">ACCENT THEME — instant, saved on this device</div>
+        <div class="accent-row" id="accentRow">
+          ${Object.keys(ACCENTS).map(name => `
+            <button class="acc-sw ${ME.user && document.body.dataset.accent === name ? "sel" : ""}"
+              data-acc="${name}" title="${name}"
+              style="--sw:${ACCENTS[name][0]};--sw2:${ACCENTS[name][1]}"><i></i>${name.toUpperCase()}</button>`).join("")}
+        </div>
+        <div class="note" style="margin-top:14px">command palette: <b style="color:var(--gold)">CTRL + K</b> —
+        pages, actions aur live key search ek jagah.</div>
+      </div>
+      <div class="card">
         <h3>ACCOUNT</h3>
         <table class="tbl"><tbody>
           <tr><td class="sub">USERNAME</td><td><b>${esc(u.username)}</b></td></tr>
@@ -1124,6 +1425,12 @@ PAGES.settings = () => {
         and every reconnect re-checks revocation &amp; device lock.</div>
       </div>
     </div>`;
+  $$("#accentRow .acc-sw").forEach(b => b.onclick = () => {
+    applyAccent(b.dataset.acc);
+    $$("#accentRow .acc-sw").forEach(x => x.classList.remove("sel"));
+    b.classList.add("sel");
+    toast("accent → " + b.dataset.acc, "gold");
+  });
   $("#pwGo").onclick = async () => {
     if ($("#pwNew").value !== $("#pwNew2").value) return toast("new passwords don't match", "err");
     const r = await api("/api/password", "POST", { old: $("#pwOld").value, new: $("#pwNew").value });
