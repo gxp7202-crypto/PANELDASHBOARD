@@ -48,7 +48,6 @@ function openModal(html, onMount) {
   if (onMount) onMount($("#modalBox"));
 }
 function closeModal() {
-  if (LIVE_TIMER) { clearInterval(LIVE_TIMER); LIVE_TIMER = null; }   // live screen poll dies with the drawer
   $("#modalRoot").classList.add("hidden"); $("#modalBox").innerHTML = "";
 }
 $("#modalRoot").addEventListener("click", e => { if (e.target.dataset.close) closeModal(); });
@@ -166,8 +165,7 @@ function showLogin() {
   $("#appView").classList.add("hidden");
   $("#loginView").classList.remove("hidden");
 }
-/* v2.3 - maintenance pill in the topbar + live screen poll state */
-let LIVE_TIMER = null, LIVE_CODE = "", LIVE_DEV = "";
+/* v2.3 - maintenance pill in the topbar */
 function paintMaintPill() {
   let p = $("#maintPill");
   const on = !!(ME && ME.maint);
@@ -182,32 +180,6 @@ function paintMaintPill() {
   }
   const t = $("#maintTxt");
   if (t) t.textContent = ME.maint_msg || "";
-}
-
-/* v2.3 - live screen viewer (key detail drawer) */
-function liveTick() {
-  const img = $("#liveImg");
-  if (!img || !document.body.contains(img)) {          // drawer closed -> stop
-    if (LIVE_TIMER) { clearInterval(LIVE_TIMER); LIVE_TIMER = null; }
-    return;
-  }
-  img.src = "/api/admin/screen?k=" + encodeURIComponent(LIVE_CODE)
-          + "&d=" + encodeURIComponent(LIVE_DEV) + "&_=" + Date.now();
-}
-function liveStartPoll() {
-  if (LIVE_TIMER) clearInterval(LIVE_TIMER);
-  liveTick();
-  LIVE_TIMER = setInterval(liveTick, 1000);
-}
-function liveState(txt, cls) {
-  const st = $("#liveState");
-  if (st) { st.className = "badge " + cls; st.textContent = txt; }
-}
-function liveResetView() {
-  const img = $("#liveImg");
-  if (img) img.classList.add("hidden");
-  const w = $("#liveWait");
-  if (w) w.classList.remove("hidden");
 }
 
 async function showApp() {
@@ -986,12 +958,12 @@ function exportDevs(devs, k) {
   if (!devs || !devs.length) return toast("koi device nahi", "err");
   const cell = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const head = ["device_id", "note", "ip", "first_seen", "last_seen",
-                "logins", "watching", "key"];
+                "logins", "key"];
   const lines = [head.join(",")].concat(devs.map(d => [
     d.device_id, d.note || "", d.ip || "",
     new Date(d.first_seen * 1000).toISOString(),
     new Date(d.last_seen * 1000).toISOString(),
-    d.uses || 0, d.watch ? "yes" : "no", k.display || k.key_code
+    d.uses || 0, k.display || k.key_code
   ].map(cell).join(",")));
   const blob = new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");
@@ -1098,7 +1070,7 @@ async function openKeyDetail(id) {
     ${k.note ? `<div class="note">note: <b style="color:var(--text)">${esc(k.note)}</b></div>` : ""}
     <label style="margin-top:16px">BOUND DEVICES (${devs.length})</label>
     ${devs.length ? `
-    <table class="tbl"><thead><tr><th>DEVICE ID</th><th>NOTE</th><th>IP</th><th>FIRST SEEN</th><th>LAST SEEN</th><th>LOGINS</th><th>STATUS</th>${canManage ? (isOwner ? "<th>LIVE</th>" : "") + "<th></th>" : ""}</tr></thead>
+    <table class="tbl"><thead><tr><th>DEVICE ID</th><th>NOTE</th><th>IP</th><th>FIRST SEEN</th><th>LAST SEEN</th><th>LOGINS</th><th>STATUS</th>${canManage ? "<th></th>" : ""}</tr></thead>
     <tbody>${devs.map(d => {
       const onNow = d.last_seen > Date.now() / 1000 - 150;
       return `
@@ -1110,14 +1082,9 @@ async function openKeyDetail(id) {
         <td class="mono">${relTime(d.first_seen)}</td>
         <td class="mono">${relTime(d.last_seen)}</td>
         <td class="mono" style="color:var(--gold);font-weight:700">${d.uses ?? 0}</td>
-        <td>${d.watch
-          ? `<span class="badge badge-gold">WATCHING</span>`
-          : onNow ? `<span class="badge badge-green">ON NOW</span>`
-                  : `<span class="badge badge-gray">OFFLINE</span>`}</td>
-        ${canManage ? `${isOwner ? `<td>${d.watch
-          ? `<button class="btn btn-sm btn-green" data-live="${esc(d.device_id)}">WATCHING</button>`
-          : `<button class="btn btn-sm btn-blue" data-live="${esc(d.device_id)}">LIVE</button>`}</td>` : ""}
-        <td><button class="btn btn-sm btn-red" data-unbind="${esc(d.device_id)}">UNBIND</button></td>` : ""}
+        <td>${onNow ? `<span class="badge badge-green">ON NOW</span>`
+                    : `<span class="badge badge-gray">OFFLINE</span>`}</td>
+        ${canManage ? `<td><button class="btn btn-sm btn-red" data-unbind="${esc(d.device_id)}">UNBIND</button></td>` : ""}
       </tr>`; }).join("")}</tbody></table>`
       : `<div class="note">koi phone abhi bind nahi hai — pehli phone jo activate karegi wo bind hogi.</div>`}
     ${devs.length && canManage ? `
@@ -1131,104 +1098,11 @@ async function openKeyDetail(id) {
         <button class="btn btn-sm btn-green" id="kdExtend">+ DAYS</button>
       </span>
     </div>` : ""}
-    ${devs.length && isOwner ? `
-    <label style="margin-top:18px">LIVE SCREEN OF THIS PHONE</label>
-    <div class="live-box">
-      <div class="live-head">
-        <span class="sub" id="liveWho">kisi device ki row me LIVE dabao</span>
-        <span class="badge badge-gray" id="liveState">IDLE</span>
-      </div>
-      <div class="live-wait" id="liveWait">frame abhi nahi hai — phone ke LIVE hone ka wait karo
-        (phone agle 20s check me stream shuru karti hai)</div>
-      <img id="liveImg" class="hidden" alt="phone screen">
-      <div class="live-ctl">
-        <button class="btn btn-sm btn-green" id="liveOn">START WATCH</button>
-        <button class="btn btn-sm btn-red" id="liveOff">STOP WATCH</button>
-        <span class="fine" style="margin:0;text-align:left">phone par screen capture chalu hota hai —
-        user ko app log me dikhta hai.</span>
-      </div>
-    </div>` : ""}
     <div class="modal-actions">
       ${canManage ? `<button class="btn btn-green" id="kdReset">OPEN RESET</button>` : ""}
       <button class="btn btn-ghost" data-close="1">CLOSE</button>
     </div>`, box => {
     bindCopy(box);
-    /* live screen: img plumbing + watch buttons */
-    const img = $("#liveImg", box);
-    if (img) {
-      img.onload = () => {
-        img.classList.remove("hidden");
-        $("#liveWait", box)?.classList.add("hidden");
-        liveState("LIVE", "badge-green");
-      };
-      img.onerror = () => {
-        img.classList.add("hidden");
-        $("#liveWait", box)?.classList.remove("hidden");
-        liveState("WAITING FOR PHONE", "badge-gray");
-      };
-    }
-    const liveOn = $("#liveOn", box), liveOff = $("#liveOff", box);
-    if (liveOn) liveOn.onclick = async () => {
-      if (!LIVE_DEV) return toast("pehle device row me LIVE dabao", "err");
-      const rr = await api("/api/admin/watch", "POST",
-        { key: code, device: LIVE_DEV, on: 1 });
-      if (rr.error) return toast(rr.error, "err");
-      $$("[data-live]", box).forEach(b => {
-        if (b.dataset.live === LIVE_DEV) {
-          b.textContent = "WATCHING";
-          b.classList.remove("btn-blue"); b.classList.add("btn-green");
-        }
-      });
-      liveState("CONNECTING", "badge-blue");
-      liveStartPoll();
-      toast("watch ON - phone 20s ke andar frame bhejegi", "gold");
-    };
-    if (liveOff) liveOff.onclick = async () => {
-      if (!LIVE_DEV) return;
-      const rr = await api("/api/admin/watch", "POST",
-        { key: code, device: LIVE_DEV, on: 0 });
-      if (rr.error) return toast(rr.error, "err");
-      if (LIVE_TIMER) { clearInterval(LIVE_TIMER); LIVE_TIMER = null; }
-      liveResetView();
-      liveState("STOPPED", "badge-red");
-      $$("[data-live]", box).forEach(b => {
-        if (b.dataset.live === LIVE_DEV) {
-          b.textContent = "LIVE";
-          b.classList.remove("btn-green"); b.classList.add("btn-blue");
-        }
-      });
-      toast("watch OFF - phone stream band kar degi", "gold");
-    };
-    $$("[data-live]", box).forEach(b => b.onclick = async () => {
-      const dev = b.dataset.live;
-      const rr = await api("/api/admin/watch", "POST",
-        { key: code, device: dev, on: 1 });
-      if (rr.error) return toast(rr.error, "err");
-      b.textContent = "WATCHING";
-      b.classList.remove("btn-blue"); b.classList.add("btn-green");
-      LIVE_CODE = code; LIVE_DEV = dev;
-      const who = $("#liveWho", box);
-      if (who) who.textContent = dev.slice(0, 20) + (dev.length > 20 ? "…" : "");
-      liveState("CONNECTING", "badge-blue");
-      liveStartPoll();
-      toast("live watch ON - phone 20s me stream shuru karegi", "gold");
-    });
-    /* phone already watching -> join the stream the moment the drawer opens */
-    const watching = devs.find(d => d.watch);
-    if (watching && $("#liveState", box)) {
-      LIVE_CODE = code; LIVE_DEV = watching.device_id;
-      const who = $("#liveWho", box);
-      if (who) who.textContent = watching.device_id.slice(0, 20)
-        + (watching.device_id.length > 20 ? "…" : "");
-      $$("[data-live]", box).forEach(b => {
-        if (b.dataset.live === watching.device_id) {
-          b.textContent = "WATCHING";
-          b.classList.remove("btn-blue"); b.classList.add("btn-green");
-        }
-      });
-      liveState("CONNECTING", "badge-blue");
-      liveStartPoll();
-    }
     $$("[data-unbind]", box).forEach(b => b.onclick = async () => {
       const rr = await api(`/api/keys/${id}/device`, "POST", { device_id: b.dataset.unbind });
       if (rr.error) return toast(rr.error, "err");
