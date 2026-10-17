@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import license_core as lc
+import apk_token as atk
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(ROOT, "static")
@@ -840,10 +841,28 @@ def api_ledger(handler, qs):
 
 # ───────────────────────── APK sync (public) ─────────────────────────
 
+def make_launch_token(device, expires, engine):
+    """what the native engine will not start without - signed here, nowhere else.
+
+    the apk stores this byte for byte.  it cannot mint one itself: the private
+    half of the key never leaves this machine, so a dex that skips the login
+    screen just ends up holding nothing and an engine that stays shut.
+    """
+    now = int(time.time())
+    dev = (device or "unknown").strip()[:64] or "unknown"
+    exp = int(expires) if expires else (now + 86400)
+    eng = (engine or "").strip().lower()
+    if len(eng) != 64 or any(c not in "0123456789abcdef" for c in eng):
+        eng = ""                      # the engine compares this to its own hash
+    pay = "%s|%d|%d|%s" % (dev, exp, now, eng)
+    return pay + "|" + atk.sign_payload(pay)
+
+
 def api_apk_verify(handler, qs):
-    """the phone hits this: key + device id in, signed receipt out."""
+    """the phone hits this: key + device id in, signed receipt + launch token out."""
     raw = (qs.get("key", [""])[0] or "")
     device = (qs.get("device", [""])[0] or "")[:64]
+    engine = (qs.get("engine", [""])[0] or "")
     code, days = lc.parse(raw)
     now = int(time.time())
     con = db()
@@ -863,10 +882,12 @@ def api_apk_verify(handler, qs):
         if leg.get("ok"):
             return jdump({"ok": True, "legacy": True, "expires": leg["expires"],
                           "permanent": leg["permanent"],
-                          "receipt": lc.make_receipt(normalize_key(raw), leg["expires"])})
+                          "receipt": lc.make_receipt(normalize_key(raw), leg["expires"]),
+                          "token": make_launch_token(device, leg["expires"], engine)})
         if lc.verify_legacy_v1(raw):
             return jdump({"ok": True, "legacy": True, "expires": 0xFFFFFFFF, "permanent": True,
-                          "receipt": ""})
+                          "receipt": "",
+                          "token": make_launch_token(device, 0xFFFFFFFF, engine)})
         return jdump({"ok": False, "reason": "invalid key"}, 200)
 
     if row["status"] != "active":
@@ -917,6 +938,7 @@ def api_apk_verify(handler, qs):
                   "custom": bool(row["custom"]),
                   "device_limit": limit, "devices_used": used,
                   "receipt": lc.make_receipt(kcode, expires),
+                  "token": make_launch_token(device, expires, engine),
                   "key": kcode})
 
 
