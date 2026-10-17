@@ -417,6 +417,16 @@ PAGES.overview = async () => {
         <div class="wire-stats" id="wireStats"></div>
         <div id="wireBox"><div class="empty" style="padding:24px"><span class="spinner"></span></div></div>
       </div>
+    </div>
+    <div class="cols" style="margin-top:15px">
+      <div class="card">
+        <h3>NEW PHONES — LAST 7 DAYS</h3>
+        <div id="devSpark"><div class="empty" style="padding:24px"><span class="spinner"></span></div></div>
+      </div>
+      <div class="card">
+        <h3>🟢 ONLINE NOW <span class="wire-live"><span class="pulse-dot"></span> LIVE</span></h3>
+        <div id="onlineNow"><div class="empty" style="padding:24px"><span class="spinner"></span></div></div>
+      </div>
     </div>`;
   $$(".stat-card .v", el).forEach(v => countUp(v, parseFloat(v.dataset.to) || 0));
   bindCopy(el);
@@ -482,6 +492,41 @@ async function loadPremium() {
     toast("+7 days added", "gold");
     loadPremium();
   });
+  // 7 day new-phone sparkline
+  const sp = $("#devSpark");
+  if (sp) {
+    const d7 = (r.live || {}).devices_7d || [];
+    const mx = Math.max(1, ...d7.map(x => x[1]));
+    sp.innerHTML = d7.length ? `<div class="chart">${d7.map(([t, n]) => {
+      const lbl = new Date(t * 1000).toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+      const h = n ? Math.max(8, Math.round(n / mx * 100)) : 3;
+      return `<div class="bar-w" title="${n} phone(s) on ${lbl}">
+        <div class="bn">${n}</div>
+        <div class="bar${n ? "" : " zero"}" style="height:${h}%"></div>
+        <div class="bl">${lbl}</div>
+      </div>`;
+    }).join("")}</div>` : `<div class="empty" style="padding:18px">no device data yet</div>`;
+  }
+  // online now — phones seen in the last 90 seconds, click opens the key
+  const onEl = $("#onlineNow");
+  if (onEl) {
+    const rows = (r.live || {}).online || [];
+    onEl.innerHTML = rows.length ? rows.map(d => `
+      <div class="wire-row">
+        <div class="wire-main">
+          <span class="mono" style="font-size:11px">${esc(String(d.note || d.device_id).slice(0, 26))}</span>
+          <div class="sub" style="letter-spacing:.05em;margin-top:2px">${esc(d.key_code)}
+            • ${d.uses || 0} logins • ${relTime(d.last_seen)}</div>
+        </div>
+        <button class="btn btn-sm btn-blue" data-okey="${esc(d.key_code)}">OPEN</button>
+      </div>`).join("") : `<div class="empty" style="padding:18px">koi phone abhi online nahi</div>`;
+    $$("[data-okey]", onEl).forEach(b => b.onclick = () => {
+      const row = LAST_ROWS.find(x => x.key_code === b.dataset.okey);
+      if (row) return openKeyDetail(row.id);
+      go("#/keys");
+      setTimeout(() => { const f = $("#fQ"); if (f) { f.value = b.dataset.okey; loadKeys(); } }, 350);
+    });
+  }
   // event wire
   renderWire(r.live || {});
   loadWire();
@@ -495,12 +540,16 @@ function renderWire(live) {
     <span title="phones seen in last 90 seconds">🟢 ${live.phones_online ?? 0} online now</span>
     <span title="phones seen in last 24h">📱 ${live.devices_24h ?? 0} devices/24h</span>
     <span title="keys used in last hour">🔥 ${live.phones_now ?? 0} active now</span>
+    <span title="phones that checked in since midnight">📆 ${live.logins_today ?? 0} logins today</span>
+    <span title="new phones bound since midnight">🆕 ${live.devices_today ?? 0} new phones today</span>
+    <span title="credits spent on keys this month">💰 ${Math.round(live.revenue_month ?? 0)} credits this month</span>
     <span title="devices blocked by limit in last 24h">⛔ ${live.blocked_devices_24h ?? 0} blocked/24h</span>`;
 }
 
 const EV_ICONS = { login: "🔑", "key.create": "✨", "key.revoke": "⛔", "key.reset": "🛠",
   "device.bind": "📱", "device.block": "⛔", "device.unbind": "🔌",
-  "device.watch": "👁", "sys.maint": "🚧", "sys.broadcast": "📢",
+  "device.watch": "👁", "device.note": "🏷", "key.limit": "🔢",
+  "sys.maint": "🚧", "sys.broadcast": "📢", "sys.update": "🔄",
   "user.create": "👤", "user.delete": "🗑", "user.ban": "🚫", balance: "💰" };
 
 async function loadWire() {
@@ -519,6 +568,7 @@ async function loadWire() {
 
 /* ───── live feed ───── */
 let FEED_KIND = "all";
+let FEED_PAUSED = false;
 const FEED_KINDS = [["all", "ALL"], ["key", "KEYS"], ["device", "DEVICES"],
                     ["user", "USERS"], ["login", "LOGINS"], ["balance", "BALANCE"]];
 
@@ -532,7 +582,9 @@ PAGES.feed = async () => {
         ${FEED_KINDS.map(([v, t]) => `
           <button class="otab ${v === FEED_KIND ? "sel" : ""}" data-k="${v}">${t}</button>`).join("")}
         <div class="spacer" style="flex:1"></div>
-        <span class="wire-live"><span class="pulse-dot"></span> STREAMING</span>
+        <span class="wire-live" id="feedToggle" style="cursor:pointer;user-select:none"
+              title="click = feed pause / resume"><span class="pulse-dot"></span>
+          <span id="feedState">${FEED_PAUSED ? "PAUSED" : "STREAMING"}</span></span>
       </div>
       <div id="feedList"><div class="empty"><span class="spinner"></span></div></div>
     </div>`;
@@ -543,7 +595,23 @@ PAGES.feed = async () => {
     loadFeed();
   });
   await loadFeed();
-  EV_POLL = setInterval(loadFeed, 5000);
+  if (!FEED_PAUSED) EV_POLL = setInterval(loadFeed, 5000);
+  const tog = $("#feedToggle");
+  if (tog) tog.onclick = () => {
+    FEED_PAUSED = !FEED_PAUSED;
+    const st = $("#feedState");
+    if (FEED_PAUSED) {
+      if (EV_POLL) { clearInterval(EV_POLL); EV_POLL = null; }
+      if (st) st.textContent = "PAUSED";
+      tog.style.opacity = ".55";
+      toast("feed paused — wire ruk gayi", "gold");
+    } else {
+      EV_POLL = setInterval(loadFeed, 5000);
+      if (st) st.textContent = "STREAMING";
+      tog.style.opacity = "1";
+      toast("feed streaming — live again", "ok");
+    }
+  };
 };
 
 async function loadFeed() {
@@ -729,7 +797,7 @@ PAGES.keys = async () => {
           <option value="all">ALL keys</option>
         </select>
         <select id="fProduct"><option value="">ALL PRODUCTS</option></select>
-        <input id="fQ" placeholder="search key / note / user / device / product…">
+        <input id="fQ" placeholder="search key / note / user / device id / ip / product…">
         <div class="spacer"></div>
         <span class="count-badge" id="kCount"></span>
         <button class="btn btn-blue" id="btnCsv">EXPORT CSV</button>
@@ -816,7 +884,7 @@ async function loadKeys() {
     <table class="tbl"><thead><tr>
       <th class="selcol">${canManage ? `<input type="checkbox" id="kSelAll">` : ""}</th>
       <th style="width:26%">KEY</th><th>PRODUCT</th><th>PLAN</th><th>ORIGIN</th><th>EXPIRES</th>
-      <th>DEVICES</th><th>STATUS</th><th>BY</th><th>ACTIONS</th></tr></thead>
+      <th>LAST SEEN</th><th>DEVICES</th><th>STATUS</th><th>BY</th><th>ACTIONS</th></tr></thead>
     <tbody>${rows.map((k, i) => {
       const lim = k.device_limit || 0, used = k.device_count || 0;
       const devBadge = lim === 0
@@ -833,6 +901,7 @@ async function loadKeys() {
         <td><span class="badge badge-gray">${durTag(k.days)}</span></td>
         <td>${originBadge(k.created_by_role)}</td>
         <td class="mono">${fmtDate(k.expires_at)}</td>
+        <td class="mono" style="white-space:nowrap;font-size:11px;color:${k.last_seen > Date.now() / 1000 - 150 ? "var(--green)" : "var(--sub)"}">${relTime(k.last_seen)}</td>
         <td>${devBadge}</td>
         <td><span class="badge ${k.status === "active" ? "badge-green" : "badge-red"}">${k.status.toUpperCase()}</span></td>
         <td>${esc(k.by)}</td>
@@ -910,6 +979,26 @@ function exportCSV(rows) {
   a.download = `yadav-keys-${Date.now()}.csv`;
   a.click(); URL.revokeObjectURL(a.href);
   toast(rows.length + " key(s) exported", "gold");
+}
+
+/* v2.4 — device table ka csv (owner ko har phone ka record chahiye) */
+function exportDevs(devs, k) {
+  if (!devs || !devs.length) return toast("koi device nahi", "err");
+  const cell = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const head = ["device_id", "note", "ip", "first_seen", "last_seen",
+                "logins", "watching", "key"];
+  const lines = [head.join(",")].concat(devs.map(d => [
+    d.device_id, d.note || "", d.ip || "",
+    new Date(d.first_seen * 1000).toISOString(),
+    new Date(d.last_seen * 1000).toISOString(),
+    d.uses || 0, d.watch ? "yes" : "no", k.display || k.key_code
+  ].map(cell).join(",")));
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `yadav-devices-${Date.now()}.csv`;
+  a.click(); URL.revokeObjectURL(a.href);
+  toast(devs.length + " device(s) exported", "gold");
 }
 
 function openKeyReset(id, rows) {
@@ -1009,12 +1098,15 @@ async function openKeyDetail(id) {
     ${k.note ? `<div class="note">note: <b style="color:var(--text)">${esc(k.note)}</b></div>` : ""}
     <label style="margin-top:16px">BOUND DEVICES (${devs.length})</label>
     ${devs.length ? `
-    <table class="tbl"><thead><tr><th>DEVICE ID</th><th>FIRST SEEN</th><th>LAST SEEN</th><th>LOGINS</th><th>STATUS</th>${canManage ? (isOwner ? "<th>LIVE</th>" : "") + "<th></th>" : ""}</tr></thead>
+    <table class="tbl"><thead><tr><th>DEVICE ID</th><th>NOTE</th><th>IP</th><th>FIRST SEEN</th><th>LAST SEEN</th><th>LOGINS</th><th>STATUS</th>${canManage ? (isOwner ? "<th>LIVE</th>" : "") + "<th></th>" : ""}</tr></thead>
     <tbody>${devs.map(d => {
       const onNow = d.last_seen > Date.now() / 1000 - 150;
       return `
       <tr>
         <td class="mono" style="font-size:11px">${esc(d.device_id)}</td>
+        <td><span class="sub" style="letter-spacing:0">${esc(d.note || "—")}</span>
+          ${canManage ? `<button class="copy-btn" data-dnote="${esc(d.device_id)}" style="margin-left:6px">EDIT</button>` : ""}</td>
+        <td class="mono" style="font-size:10px">${esc(d.ip || "—")}</td>
         <td class="mono">${relTime(d.first_seen)}</td>
         <td class="mono">${relTime(d.last_seen)}</td>
         <td class="mono" style="color:var(--gold);font-weight:700">${d.uses ?? 0}</td>
@@ -1028,6 +1120,17 @@ async function openKeyDetail(id) {
         <td><button class="btn btn-sm btn-red" data-unbind="${esc(d.device_id)}">UNBIND</button></td>` : ""}
       </tr>`; }).join("")}</tbody></table>`
       : `<div class="note">koi phone abhi bind nahi hai — pehli phone jo activate karegi wo bind hogi.</div>`}
+    ${devs.length && canManage ? `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px">
+      <button class="btn btn-sm btn-red" id="kdUnbindAll">UNBIND ALL (${devs.length})</button>
+      <button class="btn btn-sm btn-blue" id="kdExport">EXPORT CSV</button>
+      <button class="btn btn-sm btn-blue" id="kdClone">CLONE KEY</button>
+      <span style="display:flex;gap:6px;align-items:center">
+        <input id="kdDays" type="number" min="1" max="365" value="7" title="custom days"
+               style="width:70px;padding:6px">
+        <button class="btn btn-sm btn-green" id="kdExtend">+ DAYS</button>
+      </span>
+    </div>` : ""}
     ${devs.length && isOwner ? `
     <label style="margin-top:18px">LIVE SCREEN OF THIS PHONE</label>
     <div class="live-box">
@@ -1133,6 +1236,62 @@ async function openKeyDetail(id) {
       openKeyDetail(id);
       loadKeys();
     });
+    /* v2.4: phone ka naam / note */
+    $$("[data-dnote]", box).forEach(b => b.onclick = async () => {
+      const dev = b.dataset.dnote;
+      const cur = (devs.find(d => d.device_id === dev) || {}).note || "";
+      const v = prompt("phone ka naam / note (khali = hata do):", cur);
+      if (v === null) return;
+      const rr = await api(`/api/keys/${id}/device`, "POST",
+        { action: "note", device_id: dev, note: String(v).slice(0, 60) });
+      if (rr.error) return toast(rr.error, "err");
+      toast("note saved", "gold");
+      openKeyDetail(id);
+    });
+    /* v2.4: ek click me saare phones nikal do */
+    const ua = $("#kdUnbindAll", box);
+    if (ua) ua.onclick = () => {
+      const keyName = k.display || k.key_code;
+      closeModal();
+      openModal(`
+        <h3>UNBIND ALL PHONES?</h3>
+        <p class="note">${devs.length} phone(s) of <b style="color:var(--gold)">${esc(keyName)}</b>
+        se unlink ho jayenge — customer ko dobara activate karna padega
+        (agli phone jo chalegi wo nayi device banegi).</p>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" data-close="1">CANCEL</button>
+          <button class="btn btn-red" id="uaGo">YES, UNBIND ALL</button>
+        </div>`, b2 => {
+        $("#uaGo", b2).onclick = async () => {
+          const rr = await api(`/api/keys/${id}/device`, "POST", { action: "unbind_all" });
+          if (rr.error) return toast(rr.error, "err");
+          closeModal();
+          toast("sab phones unbound", "gold");
+          openKeyDetail(id);
+          loadKeys();
+        };
+      });
+    };
+    /* v2.4: device csv + clone + custom extend */
+    const exBtn = $("#kdExport", box);
+    if (exBtn) exBtn.onclick = () => exportDevs(devs, k);
+    const clBtn = $("#kdClone", box);
+    if (clBtn) clBtn.onclick = () => {
+      closeModal();
+      openCreateKey({ days: k.days, device_limit: k.device_limit || 0,
+                      product: k.product || "",
+                      note: "clone of " + (k.display || k.key_code) });
+    };
+    const exDay = $("#kdExtend", box);
+    if (exDay) exDay.onclick = async () => {
+      const n = parseInt($("#kdDays", box).value || "0");
+      if (!n || n < 1 || n > 365) return toast("1-365 days daalo", "err");
+      const rr = await api(`/api/keys/${id}/reset`, "POST", { add_days: n });
+      if (rr.error) return toast(rr.error, "err");
+      toast("+" + n + " days added", "gold");
+      openKeyDetail(id);
+      loadKeys();
+    };
     const rb = $("#kdReset", box);
     if (rb) rb.onclick = () => { closeModal(); openKeyReset(id, LAST_ROWS); };
   });
@@ -1143,11 +1302,18 @@ function confirmRevoke(id) {
     <h3>REVOKE KEY</h3>
     <p class="note">The key flips to <b style="color:var(--red)">REVOKED</b> instantly. every APK that
     reconnects to the server gets rejected on its next check — the live timer dies with it.</p>
+    <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:8px">
+      CONFIRM — type <b style="color:var(--red)">REVOKE</b> to unlock the button</label>
+    <input id="rvConfirm" placeholder="REVOKE" autocomplete="off" spellcheck="false"
+           style="text-transform:uppercase">
     <div class="modal-actions">
       <button class="btn btn-ghost" data-close="1">CANCEL</button>
-      <button class="btn btn-red" id="okRevoke">YES, REVOKE</button>
+      <button class="btn btn-red" id="okRevoke" disabled>YES, REVOKE</button>
     </div>`, box => {
-    $("#okRevoke", box).onclick = async () => {
+    const inp = $("#rvConfirm", box), ok = $("#okRevoke", box);
+    inp.oninput = () => { ok.disabled = inp.value.trim().toUpperCase() !== "REVOKE"; };
+    setTimeout(() => inp.focus(), 60);
+    ok.onclick = async () => {
       const r = await api(`/api/keys/${id}/revoke`, "POST", {});
       if (r.error) return toast(r.error, "err");
       closeModal(); toast("key revoked", "err"); loadKeys();
@@ -1155,11 +1321,17 @@ function confirmRevoke(id) {
   });
 }
 
-async function openCreateKey() {
+async function openCreateKey(pre = {}) {
   const presets = ME.presets;
   const costs = ME.costs;
   const role = ME.user.role;
-  let sel = 30, mode = "random", devlim = 1;
+  // v2.4: CLONE KEY ek purane key se yahi dialog prefilled kholta hai
+  const PRE_OPTS = [1, 2, 3, 5, 10, 0];
+  let sel = presets.includes(pre.days) ? pre.days : 30,
+      mode = "random",
+      devlim = PRE_OPTS.includes(pre.device_limit)
+        ? pre.device_limit
+        : ((pre.device_limit || 0) > 10 ? 10 : 1);
   const DEV_OPTS = [[1, "1 phone"], [2, "2 phones"], [3, "3 phones"],
                     [5, "5 phones"], [10, "10 phones"], [0, "no limit"]];
 
@@ -1173,7 +1345,8 @@ async function openCreateKey() {
     <h3>CREATE LICENSE KEYS</h3>
     <div class="step-note">1 — SELECT PRODUCT / PROJECT</div>
     <div class="prod-row">
-      <select id="mkProduct">${prodOpts(products[0] || "")}</select>
+      <select id="mkProduct">${prodOpts(pre.product && products.includes(pre.product)
+        ? pre.product : (products[0] || ""))}</select>
       <button class="btn btn-sm btn-blue" id="mkAddProd" type="button">+ ADD</button>
     </div>
     <div class="prod-new hidden" id="prodNew">
@@ -1205,7 +1378,7 @@ async function openCreateKey() {
     <div class="step-note">4 — DEVICE LIMIT <span style="color:var(--sub)">(ek key kitni phones me login hogi)</span></div>
     <div class="chips" id="devChips">
       ${DEV_OPTS.map(([v, t]) => `
-        <div class="chip ${v === 1 ? "sel" : ""}" data-dl="${v}">
+        <div class="chip ${v === devlim ? "sel" : ""}" data-dl="${v}">
           <div class="d">${v === 0 ? "∞" : v}</div>
           <div class="c">${t}</div>
         </div>`).join("")}
@@ -1221,7 +1394,8 @@ async function openCreateKey() {
     <input id="mkCount" type="number" min="1" max="100" value="1">
 
     <label>NOTE (optional — sold to…)</label>
-    <input id="mkNote" maxlength="80" placeholder="e.g. sold to rahul on whatsapp">
+    <input id="mkNote" maxlength="80" placeholder="e.g. sold to rahul on whatsapp"
+           value="${esc(pre.note || "")}">
     <div class="note" id="mkCost"></div>
     <div class="modal-actions">
       <button class="btn btn-ghost" data-close="1">CANCEL</button>
@@ -1589,9 +1763,12 @@ PAGES.settings = () => {
           LOAD STATE</button>
         <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:16px">MESSAGE PHONES SEE</label>
         <input id="maintMsg" maxlength="200" placeholder="server maintenance - try again in 10 minutes">
+        <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:12px">AUTO-OFF AFTER (MINUTES, 0 = MANUAL)</label>
+        <input id="maintMins" type="number" min="0" max="1440" value="0">
         <div class="note" style="margin-top:12px">ON = naye login band — phone pe
         <b style="color:var(--red)">MAINTENANCE</b> dikhta hai. purane sessions aur ye panel
-        bilkul chalte rahenge.</div>
+        bilkul chalte rahenge. auto-off > 0 ho to maintenance
+        <b style="color:var(--gold)">apne aap band</b> ho jayegi — bhool kar ON chhodna safe.</div>
       </div>
       <div class="card">
         <h3>APK NOTICE</h3>
@@ -1611,6 +1788,38 @@ PAGES.settings = () => {
         <div class="note" style="margin-top:12px">koi nayi phone key bind kare to turant message.
         dono field khali = alerts band.</div>
       </div>
+      ${u.role === "owner" ? `
+      <div class="card">
+        <h3>🚀 APP UPDATE — ONE APK, AUTO UPDATE</h3>
+        <div class="sys-row"><span class="sub">STAGED</span>
+          <span class="badge badge-gray" id="updState">CHECKING</span></div>
+        <div id="updMeta" class="sub" style="letter-spacing:.05em;font-size:11px;margin-top:8px"></div>
+        <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:14px">NEW VERSION NUMBER (e.g. 240 for v2.4)</label>
+        <input id="updVer" type="number" min="1" max="9999" placeholder="240">
+        <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:10px">CHANGELOG NOTE (phone log me dikhega)</label>
+        <input id="updNote" maxlength="200" placeholder="new aimbot + bug fixes">
+        <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:10px">APK FILE</label>
+        <input id="updFile" type="file" accept=".apk,application/vnd.android.package-archive"
+               style="padding:8px">
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn btn-gold-sm" id="updGo" style="flex:1" disabled>STAGE UPDATE</button>
+          <button class="btn btn-red" id="updClear" disabled>CLEAR</button>
+        </div>
+        <div id="updProg" class="sub hidden" style="margin-top:8px;letter-spacing:.1em">UPLOADING…</div>
+        <label class="sub" style="letter-spacing:.2em;font-size:10px;margin-top:16px">UPDATE HISTORY</label>
+        <div id="updHist"><div class="note">loading…</div></div>
+        <div class="note" style="margin-top:12px">stage karte hi <b style="color:var(--gold)">har phone</b>
+        apne agle 20s check me update notice lega, APK download karegi aur root se
+        <b>silent install</b> karegi. Android same-certificate wala hi install hone deta hai —
+        isi liye koi aur APK kabhi phone me nahi ghus sakta.</div>
+      </div>` : ""}
+      ${u.role !== "reseller" ? `
+      <div class="card">
+        <h3>⚙ SYSTEM STATUS</h3>
+        <div id="sysStat"><div class="note">loading…</div></div>
+        <div class="note" style="margin-top:12px">panel version, uptime, database size aur
+        totals — kuch ajeeb lage to yahi dekho.</div>
+      </div>` : ""}
     </div>`;
   $$("#accentRow .acc-sw").forEach(b => b.onclick = () => {
     applyAccent(b.dataset.acc);
@@ -1662,6 +1871,89 @@ async function loadSwitches() {
     if (rr.error) return toast(rr.error, "err");
     toast("telegram alerts saved", "ok");
   };
+
+  /* ── v2.4: apk self-update staging (owner) ───────────────────────── */
+  const vlbl = v => "v" + (v / 100).toFixed(2).replace(/0$/, "").replace(/\.$/, "");
+  const updGo = $("#updGo"), updClear = $("#updClear");
+  const paintUpdate = async () => {
+    const st = await api("/api/admin/system");
+    if (st.error) return;
+    const up = st.update || {};
+    const badge = $("#updState"), meta = $("#updMeta");
+    if (!badge) return;
+    if (up.v > 0) {
+      badge.className = "badge badge-gold";
+      badge.textContent = vlbl(up.v) + " STAGED";
+      if (meta) meta.textContent = `${(up.size / 1e6).toFixed(1)} MB • sha ${String(up.sha || "").slice(0, 12)}… • pushed ${relTime(up.at)}`;
+    } else {
+      badge.className = "badge badge-green";
+      badge.textContent = "NO UPDATE PENDING";
+      if (meta) meta.textContent = "sab phones latest build par hain (ya kuch stage hi nahi)";
+    }
+    const hist = st.history || [];
+    const hb = $("#updHist");
+    if (hb) hb.innerHTML = hist.length ? hist.map(h => `
+      <div class="sys-row"><span class="sub" style="min-width:56px">${h.v > 0 ? vlbl(h.v) : "—"}</span>
+        <b style="font-size:11px;font-weight:600">${esc(h.note || "-")}
+        <span class="sub" style="letter-spacing:.05em;font-weight:400"> •
+        ${h.size ? (h.size / 1e6).toFixed(1) + " MB" : "cleared"} • ${relTime(h.created_at)}</span></b></div>`).join("")
+      : `<div class="note">abhi tak koi update push nahi hua</div>`;
+  };
+  if (updGo && updClear) {
+    updGo.disabled = false;
+    updClear.disabled = false;
+    updGo.onclick = async () => {
+      const f = $("#updFile").files[0];
+      if (!f) return toast("pehle apk file choose karo", "err");
+      const v = parseInt($("#updVer").value || "0");
+      if (!v || v < 1) return toast("version number daalo (jaise 240 for v2.4)", "err");
+      if (f.size > 60_000_000) return toast("file 60MB se chhoti honi chahiye", "err");
+      const note = $("#updNote").value.trim();
+      const prog = $("#updProg");
+      prog.classList.remove("hidden");
+      updGo.disabled = true;
+      try {
+        const buf = await f.arrayBuffer();
+        const res = await fetch(`/api/admin/update-stage?v=${v}&note=${encodeURIComponent(note)}`, {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: buf
+        });
+        const rj = await res.json().catch(() => ({}));
+        if (!res.ok || rj.error) return toast(rj.error || "upload failed", "err");
+        toast(vlbl(v) + " staged — phones agle 20s check me update legengi", "gold");
+        $("#updVer").value = ""; $("#updNote").value = ""; $("#updFile").value = "";
+        paintUpdate();
+      } catch (e) {
+        toast("upload failed: " + (e && e.message || e), "err");
+      } finally {
+        prog.classList.add("hidden");
+        updGo.disabled = false;
+      }
+    };
+    updClear.onclick = async () => {
+      const rr = await api("/api/admin/update-clear", "POST", {});
+      if (rr.error) return toast(rr.error, "err");
+      toast("staged update cleared", "gold");
+      paintUpdate();
+    };
+    paintUpdate();
+  }
+
+  /* ── v2.4: system status card (owner + admin) ────────────────────── */
+  const sysBox = $("#sysStat");
+  if (sysBox) {
+    const st = await api("/api/admin/system");
+    sysBox.innerHTML = st.error ? `<div class="note">${esc(st.error)}</div>` : `
+      <div class="sys-row"><span class="sub">PANEL</span><b style="color:var(--gold)">v${esc(st.version)}</b></div>
+      <div class="sys-row"><span class="sub">UPTIME</span><b>${fmtUptime(st.uptime_s || 0)}</b></div>
+      <div class="sys-row"><span class="sub">PYTHON</span><b>${esc(st.python)}</b></div>
+      <div class="sys-row"><span class="sub">DATABASE</span><b>${Math.floor((st.db_bytes || 0) / 1024)} KB</b></div>
+      <div class="sys-row"><span class="sub">KEYS</span><b>${st.counts.keys}</b></div>
+      <div class="sys-row"><span class="sub">PHONES</span><b>${st.counts.devices}</b></div>
+      <div class="sys-row"><span class="sub">USERS</span><b>${st.counts.users}</b></div>
+      <div class="sys-row" style="border:none"><span class="sub">EVENTS</span><b>${st.counts.events}</b></div>`;
+  }
 }
 
 function paintMaintCard(s) {
@@ -1674,8 +1966,10 @@ function paintMaintCard(s) {
   btn.onclick = async () => {
     btn.disabled = true;
     const msg = $("#maintMsg").value.trim();
+    const minsEl = $("#maintMins");
+    const mins = Math.max(0, parseInt((minsEl && minsEl.value) || "0") || 0);
     const rr = await api("/api/admin/settings", "POST",
-      { maint: !s.maint, maint_msg: msg });
+      { maint: !s.maint, maint_msg: msg, maint_minutes: mins });
     btn.disabled = false;
     if (rr.error) return toast(rr.error, "err");
     s.maint = !s.maint;
@@ -1683,8 +1977,10 @@ function paintMaintCard(s) {
     paintMaintCard(s);
     if (ME) { ME.maint = s.maint; ME.maint_msg = s.maint ? msg : ""; }
     paintMaintPill();
-    toast(s.maint ? "MAINTENANCE ON - phones ko ab naya login nahi milega"
-                  : "maintenance OFF - logins open", s.maint ? "err" : "ok");
+    toast(s.maint
+      ? (mins > 0 ? `MAINTENANCE ON — ${mins} min me apne aap OFF ho jayegi`
+                  : "MAINTENANCE ON - phones ko ab naya login nahi milega")
+      : "maintenance OFF - logins open", s.maint ? "err" : "ok");
   };
 }
 

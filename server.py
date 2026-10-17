@@ -14,6 +14,7 @@ KEY FORMAT  YADAV-XXXXXXXX-1D/7D/15D/30D/60D/PERM
   phone that reconnects.
 """
 
+import calendar
 import hashlib
 import json
 import os
@@ -170,6 +171,22 @@ def init_db():
     if "uses" not in dcols:
         # every successful phone login bumps this - "who installed / who is using"
         con.execute("ALTER TABLE devices ADD COLUMN uses INTEGER NOT NULL DEFAULT 0")
+    if "ip" not in dcols:
+        # where the login came from - x-forwarded-for aware (renders proxy)
+        con.execute("ALTER TABLE devices ADD COLUMN ip TEXT DEFAULT ''")
+    if "note" not in dcols:
+        # owner's own label for a phone ("customer rahul", "demo phone"...)
+        con.execute("ALTER TABLE devices ADD COLUMN note TEXT DEFAULT ''")
+
+    # v2.4: staged app updates - one row per push, only the newest carries the apk
+    con.execute("CREATE TABLE IF NOT EXISTS updates ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " v INTEGER NOT NULL,"
+                " note TEXT DEFAULT '',"
+                " size INTEGER DEFAULT 0,"
+                " sha TEXT DEFAULT '',"
+                " by_user INTEGER NOT NULL DEFAULT 0,"
+                " created_at INTEGER NOT NULL)")
 
     row = con.execute("SELECT * FROM users WHERE role='owner'").fetchone()
     if row is None:
@@ -248,6 +265,12 @@ def day_start(ts: int) -> int:
     return ts - ts % 86400
 
 
+def month_start(ts: int) -> int:
+    """first instant of the month containing ts (utc, like day_start)"""
+    lt = time.gmtime(ts)
+    return calendar.timegm((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, 0))
+
+
 def clamp_device_limit(v, default=1):
     """0 = unlimited, else 1-50 phones"""
     try:
@@ -276,6 +299,23 @@ def set_setting(con, k, v):
     con.execute("INSERT OR REPLACE INTO settings (k, v) VALUES (?, ?)", (k, str(v)))
 
 
+# ── v2.4: apk self-update staging ─────────────────────────────────────────────
+def upd_stage_path():
+    """where the staged apk lives - outside the git tree, survives deploys"""
+    d = os.path.join(DATA, "updates")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "staged.apk")
+
+
+def upd_current(con):
+    """(version, note, size, sha256, staged_at) of the staged apk (0 = none)"""
+    r = con.execute("SELECT v, note, size, sha, created_at FROM updates"
+                    " ORDER BY id DESC LIMIT 1").fetchone()
+    if r is None:
+        return 0, "", 0, "", 0
+    return int(r["v"] or 0), (r["note"] or ""), int(r["size"] or 0), (r["sha"] or ""), int(r["created_at"] or 0)
+
+
 def device_rows(con, key_code):
     """devices of one key - json safe: the jpeg blob and the frame push token
     never belong in a response (blob kills json.dumps, token is phone side)"""
@@ -290,8 +330,19 @@ def device_rows(con, key_code):
 
 
 def maint_state(con):
-    """(on, message) - while on the phone gets a refusal instead of a receipt"""
-    return get_setting(con, "maint", "0") == "1", (get_setting(con, "maint_msg", "") or "").strip()
+    """(on, message) - while on the phone gets a refusal instead of a receipt.
+    a scheduled auto-off (maint_off_at) flips the switch by itself, so a
+    maintenance left on overnight cannot silently block customers forever."""
+    on = get_setting(con, "maint", "0") == "1"
+    if on:
+        off_at = int(get_setting(con, "maint_off_at", "0") or 0)
+        if off_at and int(time.time()) >= off_at:
+            set_setting(con, "maint", "0")
+            set_setting(con, "maint_off_at", "0")
+            log_event(con, "sys.maint", "maintenance auto-off reached")
+            con.commit()
+            on = False
+    return on, (get_setting(con, "maint_msg", "") or "").strip()
 
 
 def tg_notify(text):
@@ -501,9 +552,12 @@ def api_keys_list(handler, qs, body):
     if q:
         disp = ("k.key_code || '-' || CASE k.days WHEN -1 THEN 'PERM'"
                 " ELSE CAST(k.days AS TEXT) || 'D' END")
+        # a customer reads you a device id, not a key - so search phones too
         where.append(f"({disp} LIKE ? OR k.key_code LIKE ? OR k.note LIKE ?"
-                     " OR u.username LIKE ? OR k.device LIKE ? OR k.product LIKE ?)")
-        params += [f"%{q}%"] * 6
+                     " OR u.username LIKE ? OR k.device LIKE ? OR k.product LIKE ?"
+                     " OR EXISTS (SELECT 1 FROM devices d WHERE d.key_code=k.key_code"
+                     "   AND (d.device_id LIKE ? OR d.note LIKE ? OR d.ip LIKE ?)))")
+        params += [f"%{q}%"] * 6 + [f"%{q}%"] * 3
     sql = ("SELECT k.*, u.username AS by,"
            " (SELECT COUNT(DISTINCT device_id) FROM devices d WHERE d.key_code=k.key_code)"
            " AS device_count FROM keys k JOIN users u ON u.id=k.created_by"
@@ -937,9 +991,24 @@ def api_apk_verify(handler, qs):
     raw = (qs.get("key", [""])[0] or "")
     device = (qs.get("device", [""])[0] or "")[:64]
     engine = (qs.get("engine", [""])[0] or "")
+    try:
+        ver = int(qs.get("ver", ["0"])[0] or 0)      # the phone's build number
+    except Exception:
+        ver = 0
     code, days = lc.parse(raw)
     now = int(time.time())
+    # behind render the socket is the proxy - the real phone ip rides in x-forwarded-for
+    # (handler can be None in direct-call tests)
+    _hdr = handler.headers if handler is not None else None
+    _peer = handler.client_address if handler is not None else None
+    ip = (((_hdr.get("X-Forwarded-For") or "").split(",")[0].strip()
+           if _hdr is not None else "")
+          or (_peer[0] if _peer else ""))[:45]
     con = db()
+    # self-update: tell every phone older than the staged build to fetch it
+    s_v, s_note, s_size, s_sha, _ = upd_current(con)
+    upd = ({"v": s_v, "size": s_size, "sha": s_sha, "note": s_note[:160]}
+           if s_v > ver else None)
 
     # maintenance switch - panel keeps working, phones get a clean refusal
     maint, maint_msg = maint_state(con)
@@ -966,12 +1035,12 @@ def api_apk_verify(handler, qs):
                           "permanent": leg["permanent"],
                           "receipt": lc.make_receipt(normalize_key(raw), leg["expires"]),
                           "token": make_launch_token(device, leg["expires"], engine),
-                          "broadcast": broadcast})
+                          "broadcast": broadcast, "upd": upd})
         if lc.verify_legacy_v1(raw):
             return jdump({"ok": True, "legacy": True, "expires": 0xFFFFFFFF, "permanent": True,
                           "receipt": "",
                           "token": make_launch_token(device, 0xFFFFFFFF, engine),
-                          "broadcast": broadcast})
+                          "broadcast": broadcast, "upd": upd})
         return jdump({"ok": False, "reason": "invalid key"}, 200)
 
     if row["status"] != "active":
@@ -1007,8 +1076,8 @@ def api_apk_verify(handler, qs):
             screen_tok = secrets.token_hex(16)
             con.execute(
                 "INSERT INTO devices (device_id, key_code, first_seen, last_seen,"
-                " watch, screen_tok) VALUES (?,?,?,?,?,?)",
-                (device, kcode, now, now, 0, screen_tok))
+                " watch, screen_tok, ip) VALUES (?,?,?,?,?,?,?)",
+                (device, kcode, now, now, 0, screen_tok, ip))
             log_event(con, "device.bind",
                       f"phone {device[:14]}… bound to {kcode} ({used + 1}/{limit or '∞'})")
             used += 1
@@ -1022,8 +1091,8 @@ def api_apk_verify(handler, qs):
                 screen_tok = secrets.token_hex(16)
                 con.execute("UPDATE devices SET screen_tok=? WHERE key_code=? AND device_id=?",
                             (screen_tok, kcode, device))
-            con.execute("UPDATE devices SET last_seen=? WHERE key_code=? AND device_id=?",
-                        (now, kcode, device))
+            con.execute("UPDATE devices SET last_seen=?, ip=? WHERE key_code=? AND device_id=?",
+                        (now, ip, kcode, device))
         # every successful login counts - the panel shows it as "logins"
         con.execute("UPDATE devices SET uses=uses+1 WHERE key_code=? AND device_id=?",
                     (kcode, device))
@@ -1042,7 +1111,7 @@ def api_apk_verify(handler, qs):
                   "token": make_launch_token(device, expires, engine),
                   "key": kcode,
                   "watch": watch_on, "screen": screen_tok,
-                  "broadcast": broadcast})
+                  "broadcast": broadcast, "upd": upd})
 
 
 def normalize_key(raw):
@@ -1073,8 +1142,19 @@ def api_admin_settings(handler, body):
             on = 1 if body.get("maint") else 0
             set_setting(con, "maint", str(on))
             set_setting(con, "maint_msg", str(body.get("maint_msg") or "")[:200])
+            # optional auto-off so a forgotten switch cannot block customers forever
+            try:
+                mins = int(body.get("maint_minutes") or 0)
+            except Exception:
+                mins = 0
+            if on and mins > 0:
+                set_setting(con, "maint_off_at", str(int(time.time()) + mins * 60))
+            else:
+                set_setting(con, "maint_off_at", "0")
             log_event(con, "sys.maint",
-                      "%s turned maintenance %s" % (u["username"], "ON" if on else "OFF"),
+                      "%s turned maintenance %s%s" % (
+                          u["username"], "ON" if on else "OFF",
+                          (" (auto-off in %dm)" % mins) if (on and mins > 0) else ""),
                       u["id"])
         if "broadcast" in body:
             b = str(body.get("broadcast") or "")[:200]
@@ -1088,9 +1168,12 @@ def api_admin_settings(handler, body):
         con.close()
         return jdump({"ok": True})
     out = {k: get_setting(con, k, "") for k in
-           ("maint", "maint_msg", "broadcast", "tg_token", "tg_chat")}
+           ("maint", "maint_msg", "broadcast", "tg_token", "tg_chat", "maint_off_at")}
+    u_v, u_note, u_size, u_sha, u_at = upd_current(con)
     con.close()
     out["maint"] = out["maint"] == "1"
+    out["maint_off_at"] = int(out["maint_off_at"] or 0)
+    out["update"] = {"v": u_v, "note": u_note, "size": u_size, "sha": u_sha, "at": u_at}
     return jdump(out)
 
 
@@ -1199,6 +1282,139 @@ def api_admin_screen(handler, qs):
                  "X-Watch": "1" if fr["watch"] else "0"}, bytes(fr["last_frame"])
 
 
+# app self-update ----------------------------------------------------------------
+# the owner stages ONE apk here; every installed phone hears about it on its
+# next sweep, downloads it, and root-installs it. android itself refuses any
+# apk that is not signed with the same certificate, so a hijacked panel still
+# cannot push a foreign build - pm install -r just fails.
+
+def api_apk_update_info(handler, qs):
+    """public: what version is staged (the phone asks before downloading)"""
+    try:
+        ver = int(qs.get("ver", ["0"])[0] or 0)
+    except Exception:
+        ver = 0
+    con = db()
+    v, note, size, sha, at = upd_current(con)
+    con.close()
+    if v <= ver or v <= 0:
+        return jdump({"v": 0})
+    return jdump({"v": v, "size": size, "sha": sha, "note": note[:160], "at": at})
+
+
+def api_apk_update_bin(handler, qs):
+    """public: the staged apk itself, only to phones older than it"""
+    try:
+        ver = int(qs.get("ver", ["0"])[0] or 0)
+    except Exception:
+        ver = 0
+    con = db()
+    v, note, size, sha, at = upd_current(con)
+    con.close()
+    if v <= 0 or v <= ver:
+        return jdump({"error": "no update"}, 404)
+    path = upd_stage_path()
+    if not os.path.isfile(path):
+        return jdump({"error": "staged file missing - stage it again"}, 404)
+    with open(path, "rb") as f:
+        blob = f.read()
+    return 200, {"Content-Type": "application/vnd.android.package-archive",
+                 "Cache-Control": "no-store, max-age=0",
+                 "X-Update-V": str(v),
+                 "X-Update-SHA256": sha,
+                 "Content-Disposition": 'attachment; filename="update.apk"'}, blob
+
+
+def api_admin_update_stage(handler, qs):
+    """owner only: body is the raw apk bytes, query carries v + note"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] != "owner":
+        return jdump({"error": "owner only"}, 403)
+    try:
+        v = int(qs.get("v", ["0"])[0] or 0)
+    except Exception:
+        v = 0
+    note = (qs.get("note", [""])[0] or "")[:200]
+    if v <= 0:
+        return jdump({"error": "version number required"}, 400)
+    try:
+        n = int(handler.headers.get("Content-Length") or 0)
+    except Exception:
+        n = 0
+    if n < 1024 or n > 60_000_000:
+        return jdump({"error": "apk size out of range"}, 400)
+    blob = handler.rfile.read(n)
+    if not blob.startswith(b"PK\x03\x04"):            # zip magic - every apk is a zip
+        return jdump({"error": "not an apk (zip) file"}, 400)
+    sha = hashlib.sha256(blob).hexdigest()
+    path = upd_stage_path()
+    with open(path, "wb") as f:
+        f.write(blob)
+    con = db()
+    con.execute("INSERT INTO updates (v, note, size, sha, by_user, created_at)"
+                " VALUES (?,?,?,?,?,?)", (v, note, len(blob), sha, u["id"], int(time.time())))
+    log_event(con, "sys.update",
+              "%s staged app v%d (%.1f MB): %s" % (u["username"], v, len(blob) / 1e6,
+                                                   note[:70] or "-"), u["id"])
+    con.commit()
+    con.close()
+    return jdump({"ok": True, "v": v, "size": len(blob), "sha": sha})
+
+
+def api_admin_update_clear(handler, body):
+    """owner only: stop offering the staged update"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] != "owner":
+        return jdump({"error": "owner only"}, 403)
+    path = upd_stage_path()
+    if os.path.isfile(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    con = db()
+    v, _, _, _, _ = upd_current(con)
+    con.execute("INSERT INTO updates (v, note, size, sha, by_user, created_at)"
+                " VALUES (?,?,?,?,?,?)", (0, "cleared", 0, "", u["id"], int(time.time())))
+    log_event(con, "sys.update", "%s cleared staged app v%d" % (u["username"], v), u["id"])
+    con.commit()
+    con.close()
+    return jdump({"ok": True})
+
+
+def api_admin_system(handler, body):
+    """owner + admin: what is this panel running on"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] == "reseller":
+        return jdump({"error": "admins and owner only"}, 403)
+    con = db()
+    v, note, size, sha, at = upd_current(con)
+    try:
+        db_size = os.path.getsize(DB_PATH)
+    except OSError:
+        db_size = 0
+    counts = {
+        "keys": con.execute("SELECT COUNT(*) FROM keys").fetchone()[0],
+        "devices": con.execute("SELECT COUNT(*) FROM devices").fetchone()[0],
+        "users": con.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+        "events": con.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+    }
+    history = [dict(r) for r in con.execute(
+        "SELECT v, note, size, sha, created_at FROM updates ORDER BY id DESC LIMIT 10")]
+    con.close()
+    return jdump({"version": VERSION, "uptime_s": int(time.time() - STARTED_AT),
+                  "python": sys.version.split()[0], "db_bytes": db_size,
+                  "counts": counts, "update": {"v": v, "note": note, "size": size,
+                                               "sha": sha, "at": at},
+                  "history": history, "server_time": int(time.time())})
+
+
 
 
 
@@ -1236,13 +1452,40 @@ def api_key_device_unbind(handler, kid, body):
     if u["role"] == "reseller":
         return jdump({"error": "resellers cannot unbind devices"}, 403)
     dev = (body.get("device_id") or "")[:64]
-    if not dev:
+    action = (body.get("action") or "unbind")[:20]
+    if action in ("unbind", "note") and not dev:
         return jdump({"error": "no device_id"}, 400)
     con = db()
     row = con.execute("SELECT * FROM keys WHERE id=?", (kid,)).fetchone()
     if row is None:
         con.close()
         return jdump({"error": "not found"}, 404)
+
+    if action == "note":
+        # owner's private label for this phone - shows in the device table
+        con.execute("UPDATE devices SET note=? WHERE key_code=? AND device_id=?",
+                    (str(body.get("note") or "")[:60], row["key_code"], dev))
+        log_event(con, "device.note",
+                  "%s labelled phone %s on %s" % (u["username"], dev[:14], row["key_code"]),
+                  u["id"])
+        con.commit()
+        devs = device_rows(con, row["key_code"])
+        con.close()
+        return jdump({"ok": True, "devices": devs})
+
+    if action == "unbind_all":
+        n = con.execute("SELECT COUNT(*) FROM devices WHERE key_code=?",
+                        (row["key_code"],)).fetchone()[0]
+        con.execute("DELETE FROM devices WHERE key_code=?", (row["key_code"],))
+        con.execute("UPDATE keys SET device='' WHERE id=?", (kid,))
+        log_event(con, "device.unbind",
+                  "%s unbound ALL %d phones from %s" % (u["username"], n, row["key_code"]),
+                  u["id"])
+        con.commit()
+        devs = device_rows(con, row["key_code"])
+        con.close()
+        return jdump({"ok": True, "devices": devs})
+
     con.execute("DELETE FROM devices WHERE key_code=? AND device_id=?",
                 (row["key_code"], dev))
     log_event(con, "device.unbind",
@@ -1258,6 +1501,33 @@ def api_key_device_unbind(handler, kid, body):
     devs = device_rows(con, row["key_code"])
     con.close()
     return jdump({"ok": True, "devices": devs})
+
+
+def api_key_limit(handler, kid, body):
+    """owner/admin: how many phones may bind this key (0 = unlimited)"""
+    u = auth_user(handler)
+    if not u:
+        return jdump({"error": "unauthorized"}, 401)
+    if u["role"] == "reseller":
+        return jdump({"error": "admins and owner only"}, 403)
+    try:
+        lim = int(body.get("device_limit", -1))
+    except Exception:
+        return jdump({"error": "bad limit"}, 400)
+    if lim < 0 or lim > 50:
+        return jdump({"error": "limit must be 0-50 (0 = unlimited)"}, 400)
+    con = db()
+    row = con.execute("SELECT key_code FROM keys WHERE id=?", (kid,)).fetchone()
+    if row is None:
+        con.close()
+        return jdump({"error": "not found"}, 404)
+    con.execute("UPDATE keys SET device_limit=? WHERE id=?", (lim, kid))
+    log_event(con, "key.limit",
+              "%s set device limit of %s to %s" % (u["username"], row["key_code"],
+                                                   lim or "unlimited"), u["id"])
+    con.commit()
+    con.close()
+    return jdump({"ok": True, "device_limit": lim})
 
 
 def api_verify_key(handler, qs):
@@ -1380,11 +1650,27 @@ def api_stats_advanced(handler, body):
         "phones_online": con.execute(
             "SELECT COUNT(DISTINCT device_id) FROM devices WHERE last_seen > ?",
             (now - 90,)).fetchone()[0],
+        "logins_today": con.execute(
+            "SELECT COUNT(*) FROM devices WHERE last_seen >= ?", (day_start(now),)).fetchone()[0],
+        "devices_today": con.execute(
+            "SELECT COUNT(*) FROM devices WHERE first_seen >= ?", (day_start(now),)).fetchone()[0],
+        "revenue_month": -con.execute(
+            "SELECT COALESCE(SUM(delta),0) FROM ledger WHERE delta<0 AND created_at >= ?",
+            (month_start(now),)).fetchone()[0],
         "keys_expiring_3d": len(expiring),
         "blocked_devices_24h": con.execute(
             "SELECT COUNT(*) FROM events WHERE kind='device.block' AND created_at > ?",
             (now - 86400,)).fetchone()[0],
     }
+    # 7 day new-device sparkline + who is connected right this second
+    live["devices_7d"] = [
+        [t, con.execute(
+            "SELECT COUNT(*) FROM devices WHERE first_seen >= ? AND first_seen < ?",
+            (t, t + 86400)).fetchone()[0]]
+        for t in (day_start(now) - i * 86400 for i in range(6, -1, -1))]
+    live["online"] = [dict(r) for r in con.execute(
+        "SELECT device_id, key_code, last_seen, note, uses FROM devices"
+        " WHERE last_seen > ? ORDER BY last_seen DESC LIMIT 12", (now - 90,))]
     con.close()
     return jdump({"split": split, "expiring": expiring, "top": top, "live": live,
                   "server_time": now})
@@ -1416,6 +1702,12 @@ ROUTES = {
     ("POST", "/api/admin/settings"): lambda h, b, q: api_admin_settings(h, b),
     ("POST", "/api/admin/watch"):    lambda h, b, q: api_admin_watch(h, b),
     ("GET", "/api/admin/screen"):    lambda h, b, q: api_admin_screen(h, q),
+    # app self-update: phone pulls, owner stages
+    ("GET", "/api/apk/update-info"):     lambda h, b, q: api_apk_update_info(h, q),
+    ("GET", "/api/apk/update-bin"):      lambda h, b, q: api_apk_update_bin(h, q),
+    ("POST", "/api/admin/update-stage"): lambda h, b, q: api_admin_update_stage(h, q),
+    ("POST", "/api/admin/update-clear"): lambda h, b, q: api_admin_update_clear(h, b),
+    ("GET", "/api/admin/system"):        lambda h, b, q: api_admin_system(h, b),
 }
 
 CONTENT_TYPES = {
@@ -1467,6 +1759,10 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/apk/screen":
             status, hdr, resp = api_apk_screen(self, qs)
             return self._send(status, hdr, resp)
+        # raw apk bytes for update staging - same reason as the frame push
+        if method == "POST" and path == "/api/admin/update-stage":
+            status, hdr, resp = api_admin_update_stage(self, qs)
+            return self._send(status, hdr, resp)
         body = parse_body(self) if method == "POST" else {}
 
         if method == "POST" and path.startswith("/api/keys/") and path.endswith("/revoke"):
@@ -1484,6 +1780,10 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and path.startswith("/api/keys/") and path.endswith("/reset"):
             kid = path.split("/")[3]
             status, hdr, resp = api_keys_reset(self, kid, body)
+            return self._send(status, hdr, resp)
+        if method == "POST" and path.startswith("/api/keys/") and path.endswith("/limit"):
+            kid = path.split("/")[3]
+            status, hdr, resp = api_key_limit(self, kid, body)
             return self._send(status, hdr, resp)
         if method == "POST" and path.startswith("/api/users/") and path.endswith("/ban"):
             uid = path.split("/")[3]
