@@ -1454,8 +1454,10 @@ class Handler(BaseHTTPRequestHandler):
         ext = os.path.splitext(full)[1].lower()
         with open(full, "rb") as f:
             data = f.read()
+        # no-store: a panel update must show up the second it is pushed - a stale
+        # app.js from cache is exactly how an owner ends up missing a new feature
         self._send(200, {"Content-Type": CONTENT_TYPES.get(ext, "application/octet-stream"),
-                         "Cache-Control": "no-cache"}, data)
+                         "Cache-Control": "no-store, max-age=0, must-revalidate"}, data)
 
     def _api(self, method):
         parsed = urllib.parse.urlparse(self.path)
